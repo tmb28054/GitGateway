@@ -1309,6 +1309,18 @@ def _render_markdown(content: str) -> str:
             f".markdown-body a {{ color:#0366d6; }}"
             f"</style>"
             f"{html}"
+            f'<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>'
+            f"<script>"
+            f"mermaid.initialize({{startOnLoad: false}});"
+            f"document.querySelectorAll('code.language-mermaid').forEach(el => {{"
+            f"  const container = el.parentElement;"
+            f"  const div = document.createElement('div');"
+            f"  div.className = 'mermaid';"
+            f"  div.textContent = el.textContent;"
+            f"  container.replaceWith(div);"
+            f"}});"
+            f"mermaid.run();"
+            f"</script>"
             f"</div>"
         )
     except Exception:  # pylint: disable=broad-except
