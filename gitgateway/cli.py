@@ -176,93 +176,190 @@ def _handle_configure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _api_url() -> str:
+    """Get the API URL from config or environment.
+
+    Returns:
+        The API base URL.
+    """
+    import os  # pylint: disable=import-outside-toplevel
+    from gitgateway.config import get_config_value  # pylint: disable=import-outside-toplevel
+
+    url = os.environ.get("GITGATEWAY_API_URL", "")
+    if not url:
+        url = get_config_value("api_url", "") or ""
+    return url.rstrip("/")
+
+
+def _api_request(
+    method: str, path: str, body: dict | None = None,
+) -> dict | list | None:
+    """Make an API request to GitGateway.
+
+    Args:
+        method: HTTP method.
+        path: API path (e.g., '/api/groups').
+        body: Optional JSON body.
+
+    Returns:
+        Parsed JSON response, or None for 204.
+    """
+    import requests as http  # pylint: disable=import-outside-toplevel
+
+    url = f"{_api_url()}{path}"
+    kwargs: dict = {"timeout": 30}
+    if body:
+        kwargs["json"] = body
+
+    resp = http.request(method, url, **kwargs)
+    if resp.status_code == 204:
+        return None
+    if resp.status_code >= 400:
+        try:
+            err = resp.json().get("error", resp.text)
+        except Exception:  # pylint: disable=broad-except
+            err = resp.text
+        sys.stderr.write(f"Error: {err}\n")
+        return None
+    try:
+        return resp.json()
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
 def _handle_repo_create(args: argparse.Namespace) -> int:
     """Handle repo create command."""
-    _output({"action": "repo.create", "name": args.name})
-    return 0
+    parts = args.name.split("/", 1)
+    if len(parts) != 2:
+        sys.stderr.write("Error: name must be group/repo\n")
+        return 1
+    group, repo = parts
+    result = _api_request("POST", f"/api/repos/{group}", {"name": repo})
+    if result:
+        _output(result)
+        return 0
+    return 1
 
 
 def _handle_repo_list(args: argparse.Namespace) -> int:
     """Handle repo list command."""
-    _output({"action": "repo.list", "group": args.group})
+    path = f"/api/repos/{args.group}" if args.group else "/api/repos"
+    result = _api_request("GET", path)
+    if result is not None:
+        _output(result)
     return 0
 
 
 def _handle_repo_delete(args: argparse.Namespace) -> int:
     """Handle repo delete command."""
-    _output({"action": "repo.delete", "name": args.name})
+    parts = args.name.split("/", 1)
+    if len(parts) != 2:
+        sys.stderr.write("Error: name must be group/repo\n")
+        return 1
+    _api_request("DELETE", f"/api/repos/{parts[0]}/{parts[1]}")
     return 0
 
 
 def _handle_repo_fork(args: argparse.Namespace) -> int:
     """Handle repo fork command."""
-    _output({
-        "action": "repo.fork",
-        "name": args.name,
-        "target": args.target,
-    })
+    parts = args.name.split("/", 1)
+    if len(parts) != 2:
+        sys.stderr.write("Error: name must be group/repo\n")
+        return 1
+    result = _api_request(
+        "POST", f"/api/repos/{parts[0]}/{parts[1]}/fork",
+        {"target_group": args.target},
+    )
+    if result:
+        _output(result)
     return 0
 
 
 def _handle_group_create(args: argparse.Namespace) -> int:
     """Handle group create command."""
-    _output({"action": "group.create", "name": args.name})
-    return 0
+    result = _api_request("POST", "/api/groups", {"name": args.name})
+    if result:
+        _output(result)
+        return 0
+    return 1
 
 
 def _handle_group_list(args: argparse.Namespace) -> int:
     """Handle group list command."""  # pylint: disable=unused-argument
-    _output({"action": "group.list"})
+    result = _api_request("GET", "/api/groups")
+    if result is not None:
+        _output(result)
     return 0
 
 
 def _handle_access_set(args: argparse.Namespace) -> int:
     """Handle access set command."""
-    _output({
-        "action": "access.set",
-        "user": args.user,
+    result = _api_request("POST", "/api/access", {
+        "username": args.user,
         "resource": args.resource,
         "level": args.level,
     })
+    if result:
+        _output(result)
     return 0
 
 
 def _handle_access_list(args: argparse.Namespace) -> int:
     """Handle access list command."""
-    _output({"action": "access.list", "user": args.user})
+    result = _api_request("GET", f"/api/access?user={args.user}")
+    if result is not None:
+        _output(result)
     return 0
 
 
 def _handle_pr_create(args: argparse.Namespace) -> int:
     """Handle PR create command."""
-    _output({
-        "action": "pr.create",
-        "repo": args.repo,
-        "source": args.source,
-        "target": args.target,
-        "title": args.title,
-    })
-    return 0
+    parts = args.repo.split("/", 1)
+    if len(parts) != 2:
+        sys.stderr.write("Error: repo must be group/repo\n")
+        return 1
+    result = _api_request(
+        "POST", f"/api/{parts[0]}/{parts[1]}/pulls",
+        {
+            "title": args.title,
+            "source_branch": args.source,
+            "target_branch": args.target,
+        },
+    )
+    if result:
+        _output(result)
+        return 0
+    return 1
 
 
 def _handle_pr_list(args: argparse.Namespace) -> int:
     """Handle PR list command."""
-    _output({
-        "action": "pr.list",
-        "repo": args.repo,
-        "status": args.status,
-    })
+    parts = args.repo.split("/", 1)
+    if len(parts) != 2:
+        sys.stderr.write("Error: repo must be group/repo\n")
+        return 1
+    path = f"/api/{parts[0]}/{parts[1]}/pulls"
+    if args.status:
+        path += f"?status={args.status}"
+    result = _api_request("GET", path)
+    if result is not None:
+        _output(result)
     return 0
 
 
 def _handle_pr_merge(args: argparse.Namespace) -> int:
     """Handle PR merge command."""
-    _output({
-        "action": "pr.merge",
-        "repo": args.repo,
-        "number": args.number,
-        "strategy": args.strategy,
-    })
+    parts = args.repo.split("/", 1)
+    if len(parts) != 2:
+        sys.stderr.write("Error: repo must be group/repo\n")
+        return 1
+    result = _api_request(
+        "POST",
+        f"/api/{parts[0]}/{parts[1]}/pulls/{args.number}/merge",
+        {"strategy": args.strategy},
+    )
+    if result:
+        _output(result)
     return 0
 
 
