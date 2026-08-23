@@ -136,6 +136,12 @@ def handle_git_http_request(
         except Exception as exc:  # pylint: disable=broad-except
             LOG.error("Failed to sync after push: %s", exc)
 
+        # Index repo tree into DynamoDB for the web UI
+        try:
+            _index_repo_tree(local_path, group, repo_name)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.error("Failed to index repo tree: %s", exc)
+
     return status, ctype, resp_body
 
 
@@ -539,3 +545,130 @@ def _write_pack_object_simple(f, type_num, data):
     f.write(bytes([c]))
     # Compressed data
     f.write(zlib.compress(data))
+
+
+def _index_repo_tree(repo_path: Path, group: str, repo_name: str) -> None:
+    """Index the repository tree into DynamoDB for the web UI.
+
+    Walks the tree at each branch HEAD and writes file entries
+    to the gitgateway-repos table with TREE# prefix.
+
+    Args:
+        repo_path: Path to the bare repo.
+        group: Group name.
+        repo_name: Repository name.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+
+    repo = Repo(str(repo_path))
+    table = boto3.resource("dynamodb").Table("gitgateway-repos")
+
+    refs = repo.get_refs()
+    for ref_name, sha in refs.items():
+        if isinstance(ref_name, bytes):
+            ref_name = ref_name.decode()
+        if isinstance(sha, bytes):
+            sha = sha.decode()
+
+        # Only index branches (refs/heads/*)
+        if not ref_name.startswith("refs/heads/"):
+            continue
+
+        branch = ref_name[len("refs/heads/"):]
+
+        # Register branch
+        table.put_item(Item={
+            "PK": f"BRANCHES#{group}/{repo_name}",
+            "SK": f"BRANCH#{branch}",
+            "branch_name": branch,
+        })
+
+        # Get commit and tree
+        try:
+            commit_obj = repo.object_store[sha.encode()]
+            if commit_obj.type_name != b"commit":
+                continue
+            commit_message = commit_obj.message.decode(
+                errors="replace",
+            ).split("\n")[0]
+            commit_author = commit_obj.author.decode(
+                errors="replace",
+            ).split(" <")[0]
+        except (KeyError, Exception):  # pylint: disable=broad-except
+            continue
+
+        # Walk the tree and index files
+        try:
+            tree_sha = commit_obj.tree
+            _index_tree_recursive(
+                repo.object_store, table, group, repo_name, branch,
+                tree_sha, "", commit_message, commit_author,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.error("Error indexing tree for %s: %s", branch, exc)
+
+
+def _index_tree_recursive(
+    object_store,
+    table,
+    group: str,
+    repo_name: str,
+    branch: str,
+    tree_sha,
+    prefix: str,
+    commit_message: str,
+    commit_author: str,
+) -> None:
+    """Recursively index a tree into DynamoDB.
+
+    Args:
+        object_store: Dulwich object store.
+        table: DynamoDB table resource.
+        group: Group name.
+        repo_name: Repo name.
+        branch: Branch name.
+        tree_sha: SHA of the tree object.
+        prefix: Current path prefix.
+        commit_message: Last commit message (simplified).
+        commit_author: Last commit author.
+    """
+    try:
+        tree_obj = object_store[tree_sha]
+    except KeyError:
+        return
+
+    for item in tree_obj.items():
+        name = item.path.decode(errors="replace")
+        full_path = f"{prefix}{name}" if not prefix else f"{prefix}/{name}"
+        mode = item.mode
+
+        # Determine type: directory (040000) or file
+        is_dir = (mode & 0o170000) == 0o040000
+
+        if is_dir:
+            # Recurse into subdirectory
+            _index_tree_recursive(
+                object_store, table, group, repo_name, branch,
+                item.sha, full_path, commit_message, commit_author,
+            )
+        else:
+            # Read file content (limit to 1MB for DynamoDB)
+            content = ""
+            try:
+                blob = object_store[item.sha]
+                raw = blob.as_raw_string()
+                if len(raw) < 1_000_000:
+                    content = raw.decode(errors="replace")
+            except (KeyError, Exception):  # pylint: disable=broad-except
+                pass
+
+            table.put_item(Item={
+                "PK": f"TREE#{group}/{repo_name}#{branch}",
+                "SK": f"FILE#{full_path}",
+                "path": full_path,
+                "name": name,
+                "type": "file",
+                "content": content,
+                "last_commit_message": commit_message,
+                "last_commit_author": commit_author,
+            })
