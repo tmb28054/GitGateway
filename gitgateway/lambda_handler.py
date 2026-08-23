@@ -504,6 +504,29 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
                 headers=headers,
             )
 
+    # DELETE /api/repos/<group>/<repo>/branches/<branch> — delete branch
+    if (
+        path.startswith("/api/repos/")
+        and "/branches/" in path
+        and method == "DELETE"
+    ):
+        # Parse: /api/repos/group/repo/branches/branch-name
+        after_repos = path[len("/api/repos/"):]
+        br_parts = after_repos.split("/branches/", 1)
+        if len(br_parts) == 2:
+            gr_parts = br_parts[0].split("/", 1)
+            branch_to_delete = br_parts[1]
+            if len(gr_parts) == 2 and branch_to_delete:
+                import boto3 as _boto3  # pylint: disable=import-outside-toplevel
+                tbl = _boto3.resource("dynamodb").Table("gitgateway-repos")
+                tbl.delete_item(Key={
+                    "PK": f"BRANCHES#{gr_parts[0]}/{gr_parts[1]}",
+                    "SK": f"BRANCH#{branch_to_delete}",
+                })
+                return Response(
+                    status_code=204, body="", headers=headers,
+                )
+
     # POST /api/repos/<group> — create repo
     if path.startswith("/api/repos/") and method == "POST":
         group_name = path[len("/api/repos/"):]
@@ -976,6 +999,17 @@ def _get_page_content(path: str, user_info: dict) -> str:
             if len(parts) == 2:
                 return _render_commits_page(parts[0], parts[1], username)
 
+    # /groups/<group>/<repo>/branches — branches page (not inside /tree/)
+    if (
+        path.startswith("/groups/")
+        and path.endswith("/branches")
+        and "/tree/" not in path
+        and "/api/" not in path
+    ):
+        parts = path[8:].rsplit("/branches", 1)[0].split("/", 1)
+        if len(parts) == 2:
+            return _render_branches_page(parts[0], parts[1], username)
+
     # /groups/<group>/<repo>/tree/<branch>/... — file tree at branch
     if "/tree/" in path and path.startswith("/groups/"):
         # Parse /groups/<group>/<repo>/tree/<branch>[/path...]
@@ -1054,6 +1088,196 @@ def _render_user_groups_page(username: str) -> str:
         {rows}
       </tbody>
     </table>"""
+
+
+def _render_branches_page(
+    group: str, repo_name: str, username: str,
+) -> str:
+    """Render the branches management page.
+
+    Shows all branches with the ability to create and delete branches.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        username: Authenticated user.
+
+    Returns:
+        HTML content.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+    from gitgateway.db import (  # pylint: disable=import-outside-toplevel
+        get_repo, check_permission,
+    )
+    from gitgateway.models import AccessLevel  # pylint: disable=import-outside-toplevel
+
+    if not check_permission(username, group, repo_name):
+        return "<h1>403 Forbidden</h1>"
+
+    try:
+        repo = get_repo(group, repo_name)
+    except Exception:  # pylint: disable=broad-except
+        return "<h1>404 Not Found</h1>"
+
+    default_branch = repo.default_branch or "main"
+    can_write = check_permission(
+        username, group, repo_name, required_level=AccessLevel.CONTRIBUTOR,
+    )
+    is_admin = check_permission(
+        username, group, repo_name, required_level=AccessLevel.ADMIN,
+    )
+
+    # Get branches from DynamoDB
+    table = boto3.resource("dynamodb").Table("gitgateway-repos")
+    response = table.query(
+        KeyConditionExpression=(
+            "PK = :pk AND begins_with(SK, :prefix)"
+        ),
+        ExpressionAttributeValues={
+            ":pk": f"BRANCHES#{group}/{repo_name}",
+            ":prefix": "BRANCH#",
+        },
+    )
+    branches = [
+        item.get("branch_name", "") for item in response.get("Items", [])
+    ]
+    if not branches:
+        branches = [default_branch]
+
+    # Build branch rows
+    rows = ""
+    for branch in sorted(branches):
+        is_default = branch == default_branch
+        default_badge = (
+            ' <span style="background:#2ea44f;color:#fff;'
+            'padding:0.1rem 0.4rem;border-radius:3px;font-size:0.7rem;'
+            'margin-left:0.5rem;">default</span>'
+            if is_default else ""
+        )
+        delete_btn = ""
+        if can_write and not is_default:
+            delete_btn = (
+                f'<button onclick="deleteBranch(\'{branch}\')"'
+                f' style="background:#cb2431;color:#fff;border:none;'
+                f'padding:0.2rem 0.6rem;border-radius:4px;cursor:pointer;'
+                f'font-size:0.8rem;">Delete</button>'
+            )
+
+        rows += f"""<tr style="border-bottom:1px solid #f0f0f0;">
+          <td style="padding:0.75rem;">
+            <a href="/groups/{group}/{repo_name}/tree/{branch}"
+              style="font-weight:600;">{branch}</a>{default_badge}
+          </td>
+          <td style="padding:0.75rem;text-align:right;">
+            {delete_btn}
+          </td>
+        </tr>"""
+
+    # Create form (for contributors+)
+    create_form = ""
+    if can_write:
+        create_form = f"""
+    <div style="margin:1.5rem 0;padding:1rem;background:#f6f8fa;
+      border-radius:6px;border:1px solid #e1e4e8;">
+      <h3 style="margin-bottom:0.75rem;">Create Branch</h3>
+      <form id="create-branch-form" onsubmit="createBranch(event)"
+        style="display:flex;gap:0.5rem;align-items:flex-end;">
+        <div>
+          <label for="branch-name" style="display:block;font-size:0.85rem;
+            color:#586069;margin-bottom:0.2rem;">Branch name</label>
+          <input type="text" id="branch-name" name="branch" required
+            placeholder="feature/my-branch"
+            style="padding:0.4rem 0.6rem;border:1px solid #d1d5da;
+            border-radius:4px;width:250px;">
+        </div>
+        <button type="submit"
+          style="background:#2ea44f;color:#fff;border:none;
+          padding:0.45rem 1rem;border-radius:4px;cursor:pointer;">
+          Create</button>
+      </form>
+      <div id="branch-message" style="margin-top:0.5rem;font-size:0.85rem;">
+      </div>
+    </div>"""
+
+    # Settings gear
+    settings_link = ""
+    if is_admin:
+        settings_link = (
+            f'<a href="/groups/{group}/{repo_name}/settings" '
+            f'title="Settings" style="font-size:1.2rem;">⚙️</a>'
+        )
+
+    return f"""
+    <div style="display:flex;justify-content:space-between;
+      align-items:center;margin-bottom:1rem;">
+      <h1 style="margin:0;">
+        <a href="/groups/{group}" style="color:#586069;
+          font-weight:normal;">{group}</a> /
+        <a href="/groups/{group}/{repo_name}">{repo_name}</a>
+      </h1>
+      {settings_link}
+    </div>
+
+    <div style="display:flex;gap:1rem;border-bottom:1px solid #e1e4e8;
+      margin-bottom:1.5rem;">
+      <a href="/groups/{group}/{repo_name}"
+        style="padding:0.5rem 1rem;color:#586069;">Code</a>
+      <a href="/groups/{group}/{repo_name}/pulls"
+        style="padding:0.5rem 1rem;color:#586069;">Pull Requests</a>
+      <a href="/groups/{group}/{repo_name}/commits"
+        style="padding:0.5rem 1rem;color:#586069;">Commits</a>
+      <a href="/groups/{group}/{repo_name}/branches"
+        style="padding:0.5rem 1rem;font-weight:600;
+        border-bottom:2px solid #f9826c;">Branches</a>
+    </div>
+
+    {create_form}
+
+    <h2 style="margin-bottom:1rem;">{len(branches)} branch{'es' if len(branches) != 1 else ''}</h2>
+
+    <table style="width:100%;border-collapse:collapse;
+      border:1px solid #e1e4e8;border-radius:6px;">
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+
+    <script>
+    async function createBranch(e) {{
+      e.preventDefault();
+      const branch = document.getElementById('branch-name').value;
+      const msg = document.getElementById('branch-message');
+      try {{
+        const resp = await fetch('/api/repos/{group}/{repo_name}/branches', {{
+          method: 'POST',
+          headers: {{'Content-Type': 'application/json'}},
+          body: JSON.stringify({{branch}})
+        }});
+        if (resp.ok) {{
+          msg.innerHTML = '<span style="color:#2ea44f;">Branch created!</span>';
+          setTimeout(() => location.reload(), 500);
+        }} else {{
+          const data = await resp.json();
+          msg.innerHTML = '<span style="color:#cb2431;">'
+            + (data.error || 'Failed') + '</span>';
+        }}
+      }} catch(err) {{
+        msg.innerHTML = '<span style="color:#cb2431;">' + err + '</span>';
+      }}
+    }}
+
+    async function deleteBranch(branch) {{
+      if (!confirm('Delete branch "' + branch + '"?')) return;
+      const resp = await fetch('/api/repos/{group}/{repo_name}/branches/' + branch, {{
+        method: 'DELETE'
+      }});
+      if (resp.ok || resp.status === 204) {{
+        location.reload();
+      }} else {{
+        alert('Failed to delete branch');
+      }}
+    }}
+    </script>"""
 
 
 def _render_commit_diff_page(
@@ -1411,6 +1635,8 @@ def _render_commits_page(
       <a href="/groups/{group}/{repo_name}/commits"
         style="padding:0.5rem 1rem;font-weight:600;
         border-bottom:2px solid #f9826c;">Commits</a>
+      <a href="/groups/{group}/{repo_name}/branches"
+        style="padding:0.5rem 1rem;color:#586069;">Branches</a>
     </div>
 
     <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem;">
@@ -1703,6 +1929,8 @@ def _render_file_viewer(  # pylint: disable=too-many-positional-arguments
         style="padding:0.5rem 1rem;color:#586069;">Pull Requests</a>
       <a href="/groups/{group}/{repo_name}/commits"
         style="padding:0.5rem 1rem;color:#586069;">Commits</a>
+      <a href="/groups/{group}/{repo_name}/branches"
+        style="padding:0.5rem 1rem;color:#586069;">Branches</a>
     </div>
 
     <div style="margin-bottom:1rem;color:#586069;font-size:0.9rem;">
@@ -2068,6 +2296,8 @@ git push -u origin main</pre>
         style="padding:0.5rem 1rem;color:#586069;">Pull Requests</a>
       <a href="/groups/{group}/{repo_name}/commits"
         style="padding:0.5rem 1rem;color:#586069;">Commits</a>
+      <a href="/groups/{group}/{repo_name}/branches"
+        style="padding:0.5rem 1rem;color:#586069;">Branches</a>
     </div>
 
     <div style="display:flex;justify-content:space-between;
