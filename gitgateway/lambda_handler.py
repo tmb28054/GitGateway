@@ -1195,8 +1195,20 @@ def _render_file_viewer(  # pylint: disable=too-many-positional-arguments
     filename = file_path.split("/")[-1]
     line_count = len(content.split("\n")) if content else 0
 
-    # Syntax highlight using Pygments
-    highlighted = _highlight_code(content, filename)
+    # Determine if this is a markdown file
+    is_markdown = filename.lower().endswith((".md", ".markdown", ".mdown"))
+
+    if is_markdown:
+        rendered_content = _render_markdown(content)
+        file_display = f"""
+      <div style="padding:1.5rem;">{rendered_content}</div>"""
+    else:
+        # Syntax highlight using Pygments
+        highlighted = _highlight_code(content, filename)
+        file_display = f"""
+      <div id="file-content" style="overflow-x:auto;">
+        {highlighted}
+      </div>"""
 
     # Build breadcrumb
     parts = file_path.split("/")
@@ -1255,10 +1267,53 @@ def _render_file_viewer(  # pylint: disable=too-many-positional-arguments
           border-radius:4px;cursor:pointer;background:#fafbfc;
           font-size:0.8rem;">Copy</button>
       </div>
-      <div id="file-content" style="overflow-x:auto;">
-        {highlighted}
-      </div>
+      {file_display}
     </div>"""
+
+
+def _render_markdown(content: str) -> str:
+    """Render Markdown content as HTML.
+
+    Args:
+        content: Raw markdown text.
+
+    Returns:
+        Rendered HTML with basic styling.
+    """
+    try:
+        import markdown  # pylint: disable=import-outside-toplevel
+
+        html = markdown.markdown(
+            content,
+            extensions=["fenced_code", "tables", "toc"],
+        )
+        # Wrap in styled container
+        return (
+            '<div class="markdown-body" style="'
+            "font-size:0.95rem;line-height:1.7;"
+            '">'
+            f"<style>"
+            f".markdown-body h1 {{ font-size:2rem; border-bottom:1px solid #e1e4e8; padding-bottom:0.3rem; margin:1.5rem 0 1rem; }}"
+            f".markdown-body h2 {{ font-size:1.5rem; border-bottom:1px solid #e1e4e8; padding-bottom:0.3rem; margin:1.5rem 0 1rem; }}"
+            f".markdown-body h3 {{ font-size:1.25rem; margin:1.2rem 0 0.8rem; }}"
+            f".markdown-body p {{ margin:0.5rem 0; }}"
+            f".markdown-body code {{ background:#f6f8fa; padding:0.2rem 0.4rem; border-radius:3px; font-size:0.85em; }}"
+            f".markdown-body pre {{ background:#f6f8fa; padding:1rem; border-radius:6px; overflow-x:auto; }}"
+            f".markdown-body pre code {{ background:none; padding:0; }}"
+            f".markdown-body ul, .markdown-body ol {{ padding-left:2rem; margin:0.5rem 0; }}"
+            f".markdown-body li {{ margin:0.25rem 0; }}"
+            f".markdown-body table {{ border-collapse:collapse; margin:1rem 0; }}"
+            f".markdown-body th, .markdown-body td {{ border:1px solid #e1e4e8; padding:0.5rem 0.75rem; }}"
+            f".markdown-body th {{ background:#f6f8fa; }}"
+            f".markdown-body blockquote {{ border-left:4px solid #dfe2e5; padding:0 1rem; color:#586069; margin:1rem 0; }}"
+            f".markdown-body a {{ color:#0366d6; }}"
+            f"</style>"
+            f"{html}"
+            f"</div>"
+        )
+    except Exception:  # pylint: disable=broad-except
+        import html as html_mod  # pylint: disable=import-outside-toplevel
+        return f"<pre>{html_mod.escape(content)}</pre>"
 
 
 def _highlight_code(content: str, filename: str) -> str:
@@ -1496,7 +1551,7 @@ git push -u origin main</pre>
                   <h3 style="padding-bottom:0.5rem;
                     border-bottom:1px solid #e1e4e8;margin-bottom:1rem;">
                     README.md</h3>
-                  <div style="white-space:pre-wrap;">{readme_content}</div>
+                  {_render_markdown(readme_content)}
                 </div>"""
             break
 

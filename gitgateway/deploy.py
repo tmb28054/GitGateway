@@ -78,6 +78,7 @@ def package_lambda(output_dir: Path | None = None) -> Path:
     requirements = [
         "dulwich",
         "jinja2",
+        "markdown",
         "pygments",
         "pyjwt[crypto]",
         "cryptography",
