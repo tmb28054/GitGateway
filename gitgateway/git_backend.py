@@ -1,0 +1,541 @@
+"""Dulwich-based Git Smart HTTP backend for GitGateway.
+
+Pure Python implementation of the Git Smart HTTP protocol using
+Dulwich. Handles info/refs, git-upload-pack, and git-receive-pack
+without requiring a git binary.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import tempfile
+from pathlib import Path
+
+from dulwich.objects import Blob, Commit, Tree
+from dulwich.repo import Repo
+from dulwich.server import (
+    DictBackend,
+    ReceivePackHandler,
+    UploadPackHandler,
+)
+from dulwich.web import (
+    HTTPGitApplication,
+    get_info_refs,
+    handle_service_request,
+)
+
+from gitgateway.storage import (
+    sync_repo_to_local,
+    sync_repo_to_s3,
+    repo_exists,
+)
+
+LOG = logging.getLogger(__name__)
+
+DEFAULT_BUCKET = "gitgateway-repos"
+
+
+class GitBackendError(Exception):
+    """Raised when a git backend operation fails."""
+
+
+def handle_git_http_request(
+    method: str,
+    path_info: str,
+    query_string: str,
+    body: bytes,
+    group: str,
+    repo_name: str,
+    content_type: str = "",
+    bucket: str = DEFAULT_BUCKET,
+) -> tuple[int, str, bytes]:
+    """Handle a Git Smart HTTP request using Dulwich.
+
+    Syncs the bare repo from S3, handles the git protocol request,
+    then syncs any changes back to S3.
+
+    Args:
+        method: HTTP method (GET or POST).
+        path_info: Path after the repo (e.g., /info/refs).
+        query_string: Query string.
+        body: Request body bytes.
+        group: Repository group.
+        repo_name: Repository name.
+        content_type: Request Content-Type.
+        bucket: S3 bucket name.
+
+    Returns:
+        Tuple of (status_code, content_type, response_body).
+    """
+    local_base = Path(tempfile.gettempdir()) / "gitgateway"
+    local_base.mkdir(parents=True, exist_ok=True)
+    local_path = local_base / group / f"{repo_name}.git"
+
+    # Sync repo from S3 or init fresh
+    try:
+        if repo_exists(group, repo_name, bucket=bucket):
+            sync_repo_to_local(
+                group, repo_name, bucket=bucket, local_base=local_base,
+            )
+            # Verify Dulwich can open it
+            Repo(str(local_path))
+        else:
+            # Init a new bare repo with Dulwich directly
+            local_path.mkdir(parents=True, exist_ok=True)
+            Repo.init_bare(str(local_path))
+            # Sync the new bare repo to S3
+            sync_repo_to_s3(local_path, group, repo_name, bucket=bucket)
+    except Exception as exc:  # pylint: disable=broad-except
+        # If sync failed or repo corrupt, init fresh
+        LOG.warning("Repo init/sync issue, reinitializing: %s", exc)
+        if local_path.exists():
+            import shutil  # pylint: disable=import-outside-toplevel
+            shutil.rmtree(local_path)
+        local_path.mkdir(parents=True, exist_ok=True)
+        Repo.init_bare(str(local_path))
+        sync_repo_to_s3(local_path, group, repo_name, bucket=bucket)
+
+    # Determine service
+    service = ""
+    if query_string:
+        for param in query_string.split("&"):
+            if param.startswith("service="):
+                service = param[8:]
+                break
+
+    is_receive = (
+        service == "git-receive-pack"
+        or "git-receive-pack" in path_info
+    )
+
+    try:
+        if "/info/refs" in path_info:
+            status, ctype, resp_body = _handle_info_refs(
+                local_path, service,
+            )
+        elif "git-upload-pack" in path_info:
+            status, ctype, resp_body = _handle_upload_pack(
+                local_path, body,
+            )
+        elif "git-receive-pack" in path_info:
+            status, ctype, resp_body = _handle_receive_pack(
+                local_path, body,
+            )
+        else:
+            return 404, "text/plain", b"Not found"
+    except Exception as exc:  # pylint: disable=broad-except
+        LOG.error("Git backend error: %s", exc)
+        return 500, "text/plain", f"Internal error: {exc}".encode()
+
+    # Sync back to S3 after receive-pack (push)
+    if is_receive and status == 200:
+        try:
+            sync_repo_to_s3(local_path, group, repo_name, bucket=bucket)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.error("Failed to sync after push: %s", exc)
+
+    return status, ctype, resp_body
+
+
+def _handle_info_refs(
+    repo_path: Path, service: str,
+) -> tuple[int, str, bytes]:
+    """Handle GET /info/refs?service=<service>.
+
+    Args:
+        repo_path: Path to bare repo.
+        service: The git service name.
+
+    Returns:
+        Tuple of (status, content_type, body).
+    """
+    repo = Repo(str(repo_path))
+
+    if service == "git-upload-pack":
+        ctype = "application/x-git-upload-pack-advertisement"
+    elif service == "git-receive-pack":
+        ctype = "application/x-git-receive-pack-advertisement"
+    else:
+        return 400, "text/plain", b"Invalid service"
+
+    # Build pkt-line response
+    output = io.BytesIO()
+
+    # Service announcement
+    line = f"# service={service}\n"
+    pkt = f"{len(line) + 4:04x}{line}".encode()
+    output.write(pkt)
+    output.write(b"0000")  # flush
+
+    # List refs
+    refs = repo.get_refs()
+    capabilities = b"report-status delete-refs ofs-delta side-band-64k"
+
+    first = True
+    for ref_name, sha in sorted(refs.items()):
+        if isinstance(ref_name, str):
+            ref_name = ref_name.encode()
+        if isinstance(sha, str):
+            sha = sha.encode()
+
+        if first:
+            line_data = sha + b" " + ref_name + b"\x00" + capabilities + b"\n"
+            first = False
+        else:
+            line_data = sha + b" " + ref_name + b"\n"
+
+        pkt_line = f"{len(line_data) + 4:04x}".encode() + line_data
+        output.write(pkt_line)
+
+    if first:
+        # Empty repo — send capabilities with zero-id
+        zero_id = b"0" * 40
+        line_data = (
+            zero_id + b" capabilities^{}\x00" + capabilities + b"\n"
+        )
+        pkt_line = f"{len(line_data) + 4:04x}".encode() + line_data
+        output.write(pkt_line)
+
+    output.write(b"0000")  # flush
+
+    return 200, ctype, output.getvalue()
+
+
+def _handle_upload_pack(
+    repo_path: Path, body: bytes,
+) -> tuple[int, str, bytes]:
+    """Handle POST /git-upload-pack (fetch/clone).
+
+    Args:
+        repo_path: Path to bare repo.
+        body: Request body with wants/haves.
+
+    Returns:
+        Tuple of (status, content_type, body).
+    """
+    from dulwich.pack import (  # pylint: disable=import-outside-toplevel
+        write_pack_data,
+    )
+    from dulwich.object_store import (  # pylint: disable=import-outside-toplevel
+        MemoryObjectStore,
+    )
+
+    repo = Repo(str(repo_path))
+
+    # Parse wants from request
+    wants = []
+    lines = body.split(b"\n")
+    for line in lines:
+        line = line.strip()
+        if not line or line == b"0000":
+            continue
+        # Strip pkt-line length prefix (4 hex chars)
+        if len(line) > 4 and line[:4].isalnum():
+            line = line[4:]
+        if line.startswith(b"want "):
+            sha = line[5:45].decode()
+            wants.append(sha.encode())
+        elif line == b"done":
+            break
+
+    if not wants:
+        # Client just wants refs (already handled by info/refs)
+        return 200, "application/x-git-upload-pack-result", b"0000"
+
+    # Generate pack with requested objects
+    output = io.BytesIO()
+    # NAK
+    output.write(b"0008NAK\n")
+
+    # Get all objects reachable from wants
+    object_store = repo.object_store
+
+    try:
+        pack_data = io.BytesIO()
+        objects_to_send = []
+        for want_sha in wants:
+            try:
+                obj = object_store[want_sha]
+                objects_to_send.append(obj)
+                # Walk the tree for commits
+                if obj.type_name == b"commit":
+                    _collect_objects(object_store, obj, objects_to_send)
+            except KeyError:
+                continue
+
+        if objects_to_send:
+            # Write pack
+            entries = [
+                (obj.type_name, obj.as_raw_string())
+                for obj in objects_to_send
+            ]
+            from dulwich.pack import (  # pylint: disable=import-outside-toplevel
+                write_pack_header, write_pack_object,
+                compute_file_sha,
+            )
+            import struct  # pylint: disable=import-outside-toplevel
+            import hashlib  # pylint: disable=import-outside-toplevel
+
+            num_objects = len(entries)
+            # Pack header
+            pack_data.write(b"PACK")
+            pack_data.write(struct.pack(">I", 2))  # version
+            pack_data.write(struct.pack(">I", num_objects))
+
+            for type_name, raw in entries:
+                type_num = {
+                    b"commit": 1, b"tree": 2,
+                    b"blob": 3, b"tag": 4,
+                }[type_name]
+                _write_pack_object_simple(pack_data, type_num, raw)
+
+            # Pack checksum
+            pack_data.seek(0)
+            sha = hashlib.sha1(pack_data.read()).digest()  # nosec
+            pack_data.write(sha)
+
+            # Sideband pack data
+            pack_data.seek(0)
+            pack_bytes = pack_data.read()
+
+            # Send as sideband channel 1
+            chunk_size = 65515
+            for i in range(0, len(pack_bytes), chunk_size):
+                chunk = pack_bytes[i:i + chunk_size]
+                sideband = b"\x01" + chunk
+                pkt = f"{len(sideband) + 4:04x}".encode() + sideband
+                output.write(pkt)
+
+        output.write(b"0000")  # flush
+    except Exception as exc:  # pylint: disable=broad-except
+        LOG.error("upload-pack error: %s", exc)
+        return 200, "application/x-git-upload-pack-result", b"0008NAK\n0000"
+
+    return 200, "application/x-git-upload-pack-result", output.getvalue()
+
+
+def _handle_receive_pack(
+    repo_path: Path, body: bytes,
+) -> tuple[int, str, bytes]:
+    """Handle POST /git-receive-pack (push).
+
+    Args:
+        repo_path: Path to bare repo.
+        body: Request body with ref updates and pack data.
+
+    Returns:
+        Tuple of (status, content_type, body).
+    """
+    from dulwich.pack import (  # pylint: disable=import-outside-toplevel
+        PackData, Pack,
+    )
+
+    repo = Repo(str(repo_path))
+
+    # Parse the request: ref updates followed by pack data
+    # Format: pkt-lines with "old new refname" then PACK data
+    ref_updates = []
+    pack_start = 0
+
+    i = 0
+    while i < len(body):
+        # Read pkt-line length
+        if i + 4 > len(body):
+            break
+        length_str = body[i:i + 4]
+        try:
+            length = int(length_str, 16)
+        except ValueError:
+            break
+
+        if length == 0:
+            i += 4
+            break  # flush — pack data follows
+
+        line = body[i + 4:i + length]
+        i += length
+
+        # Parse ref update line
+        line = line.strip(b"\n")
+        # Remove capabilities from first line
+        if b"\x00" in line:
+            line = line.split(b"\x00")[0]
+
+        parts = line.split(b" ", 2)
+        if len(parts) == 3:
+            old_sha, new_sha, ref_name = parts
+            ref_updates.append((
+                old_sha.decode(),
+                new_sha.decode(),
+                ref_name.decode(),
+            ))
+
+    # The rest is pack data
+    pack_data = body[i:]
+
+    # Apply pack if present
+    if pack_data and pack_data[:4] == b"PACK":
+        try:
+            # Write pack to repo
+            pack_file = io.BytesIO(pack_data)
+            repo.object_store.add_thin_pack(pack_file.read, None)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.error("Failed to apply pack: %s", exc)
+            # Return error report
+            output = _build_report_status(
+                ref_updates, error=str(exc),
+            )
+            return (
+                200, "application/x-git-receive-pack-result", output,
+            )
+
+    # Apply ref updates
+    for old_sha, new_sha, ref_name in ref_updates:
+        zero = "0" * 40
+        if new_sha == zero:
+            # Delete ref
+            if isinstance(ref_name, str):
+                ref_name_bytes = ref_name.encode()
+            else:
+                ref_name_bytes = ref_name
+            del repo.refs[ref_name_bytes]
+        else:
+            if isinstance(ref_name, str):
+                ref_name_bytes = ref_name.encode()
+            else:
+                ref_name_bytes = ref_name
+            if isinstance(new_sha, str):
+                new_sha_bytes = new_sha.encode()
+            else:
+                new_sha_bytes = new_sha
+            repo.refs[ref_name_bytes] = new_sha_bytes
+
+    # Build success report
+    output = _build_report_status(ref_updates)
+    return 200, "application/x-git-receive-pack-result", output
+
+
+def _build_report_status(
+    ref_updates: list[tuple[str, str, str]],
+    error: str = "",
+) -> bytes:
+    """Build a receive-pack report-status response.
+
+    Args:
+        ref_updates: List of (old, new, refname) tuples.
+        error: Optional error message.
+
+    Returns:
+        Pkt-line encoded report status wrapped in sideband.
+    """
+    # Build the status lines
+    status_lines = io.BytesIO()
+
+    if error:
+        line = f"unpack {error}\n".encode()
+    else:
+        line = b"unpack ok\n"
+    status_lines.write(f"{len(line) + 4:04x}".encode() + line)
+
+    for _, _, ref_name in ref_updates:
+        if error:
+            line = f"ng {ref_name} {error}\n".encode()
+        else:
+            line = f"ok {ref_name}\n".encode()
+        status_lines.write(f"{len(line) + 4:04x}".encode() + line)
+
+    status_lines.write(b"0000")
+
+    # Wrap in sideband channel 1
+    output = io.BytesIO()
+    data = status_lines.getvalue()
+    sideband = b"\x01" + data
+    pkt = f"{len(sideband) + 4:04x}".encode() + sideband
+    output.write(pkt)
+    output.write(b"0000")
+
+    return output.getvalue()
+
+
+def _collect_objects(object_store, commit_obj, objects_list):
+    """Recursively collect objects from a commit.
+
+    Args:
+        object_store: The repo's object store.
+        commit_obj: A commit object.
+        objects_list: List to append objects to.
+    """
+    seen = {o.id for o in objects_list}
+
+    # Add tree
+    tree_sha = commit_obj.tree
+    if tree_sha not in seen:
+        try:
+            tree = object_store[tree_sha]
+            objects_list.append(tree)
+            seen.add(tree_sha)
+            _collect_tree_objects(object_store, tree, objects_list, seen)
+        except KeyError:
+            pass
+
+    # Walk parents (limited depth for performance)
+    for parent_sha in commit_obj.parents[:5]:
+        if parent_sha not in seen:
+            try:
+                parent = object_store[parent_sha]
+                objects_list.append(parent)
+                seen.add(parent_sha)
+                _collect_objects(object_store, parent, objects_list)
+            except KeyError:
+                pass
+
+
+def _collect_tree_objects(object_store, tree_obj, objects_list, seen):
+    """Collect blob and sub-tree objects from a tree.
+
+    Args:
+        object_store: The repo's object store.
+        tree_obj: A tree object.
+        objects_list: List to append to.
+        seen: Set of already-seen object IDs.
+    """
+    for item in tree_obj.items():
+        sha = item.sha
+        if sha in seen:
+            continue
+        seen.add(sha)
+        try:
+            obj = object_store[sha]
+            objects_list.append(obj)
+            if obj.type_name == b"tree":
+                _collect_tree_objects(
+                    object_store, obj, objects_list, seen,
+                )
+        except KeyError:
+            pass
+
+
+def _write_pack_object_simple(f, type_num, data):
+    """Write a pack object in the simplest format.
+
+    Args:
+        f: File-like object to write to.
+        type_num: Git object type number (1-4).
+        data: Raw uncompressed object data.
+    """
+    import zlib  # pylint: disable=import-outside-toplevel
+
+    size = len(data)
+    # First byte: type (3 bits) + size (4 bits)
+    c = (type_num << 4) | (size & 0x0F)
+    size >>= 4
+    while size:
+        c |= 0x80
+        f.write(bytes([c]))
+        c = size & 0x7F
+        size >>= 7
+    f.write(bytes([c]))
+    # Compressed data
+    f.write(zlib.compress(data))

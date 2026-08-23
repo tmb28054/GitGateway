@@ -76,6 +76,7 @@ def package_lambda(output_dir: Path | None = None) -> Path:
 
     # Install dependencies into build dir
     requirements = [
+        "dulwich",
         "jinja2",
         "pygments",
         "pyjwt[crypto]",

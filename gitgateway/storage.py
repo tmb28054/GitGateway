@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess  # nosec B404 - Required for git init
 from pathlib import Path
 
 import boto3
@@ -90,13 +89,9 @@ def init_bare_repo(
     local_path.mkdir(parents=True, exist_ok=True)
 
     try:
-        subprocess.run(  # nosec
-            ["git", "init", "--bare", str(local_path)],
-            capture_output=True,
-            check=True,
-            timeout=30,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        from dulwich.repo import Repo as DulwichRepo  # pylint: disable=import-outside-toplevel
+        DulwichRepo.init_bare(str(local_path))
+    except Exception as exc:  # pylint: disable=broad-except
         raise StorageError(
             f"Failed to initialize bare repo: {exc}",
         ) from exc

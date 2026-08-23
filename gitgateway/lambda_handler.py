@@ -277,10 +277,34 @@ def _dispatch(handler_name: str, request: Request) -> Response:
         return _handle_api(request)
 
     if handler_name == "git":
+        from gitgateway.git_backend import (  # pylint: disable=import-outside-toplevel
+            handle_git_http_request,
+        )
+        # Extract group/repo from the path
+        import re as _re  # pylint: disable=import-outside-toplevel
+        match = _re.match(r"^/([^/]+)/([^/]+)\.git/(.*)", request.path)
+        if not match:
+            return Response(
+                status_code=400, body=b"Invalid git URL",
+                headers={"Content-Type": "text/plain"},
+            )
+        group = match.group(1)
+        repo_name = match.group(2)
+        git_path = "/" + match.group(3)
+
+        status, ctype, resp_body = handle_git_http_request(
+            method=request.method,
+            path_info=git_path,
+            query_string=request.query_string,
+            body=request.body,
+            group=group,
+            repo_name=repo_name,
+            content_type=request.headers.get("content-type", ""),
+        )
         return Response(
-            status_code=200,
-            body=b"",
-            headers={"Content-Type": "application/octet-stream"},
+            status_code=status,
+            body=resp_body,
+            headers={"Content-Type": ctype},
         )
 
     if handler_name == "lfs":
@@ -585,6 +609,54 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
                     body=json.dumps({"error": "Repository not found"}),
                     headers=headers,
                 )
+
+    # POST /api/<group>/<repo>/pulls — create PR
+    pr_match = re.match(r"^/api/([^/]+)/([^/]+)/pulls$", path)
+    if pr_match and method == "POST":
+        from gitgateway.pullrequest import (  # pylint: disable=import-outside-toplevel
+            create_pr, PullRequest,
+        )
+        try:
+            body = json.loads(request.body.decode()) if request.body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return Response(
+                status_code=400,
+                body=json.dumps({"error": "Invalid JSON"}),
+                headers=headers,
+            )
+        pr_group = pr_match.group(1)
+        pr_repo = pr_match.group(2)
+        pr = create_pr(PullRequest(
+            title=body.get("title", ""),
+            source_branch=body.get("source_branch", ""),
+            target_branch=body.get("target_branch", "main"),
+            author=body.get("author", ""),
+            group=pr_group,
+            repo=pr_repo,
+        ))
+        return Response(
+            status_code=201,
+            body=json.dumps(pr.to_dict()),
+            headers=headers,
+        )
+
+    # GET /api/<group>/<repo>/pulls — list PRs
+    if pr_match and method == "GET":
+        from gitgateway.pullrequest import (  # pylint: disable=import-outside-toplevel
+            list_prs, PrStatus,
+        )
+        pr_group = pr_match.group(1)
+        pr_repo = pr_match.group(2)
+        status_filter = None
+        for param in request.query_string.split("&"):
+            if param.startswith("status="):
+                status_filter = PrStatus(param[7:])
+        prs = list_prs(pr_group, pr_repo, status_filter)
+        return Response(
+            status_code=200,
+            body=json.dumps([p.to_dict() for p in prs]),
+            headers=headers,
+        )
 
     # POST /api/access — grant access
     if path == "/api/access" and method == "POST":

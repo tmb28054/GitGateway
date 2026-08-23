@@ -251,6 +251,8 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 300
       MemorySize: 512
+      EphemeralStorage:
+        Size: 10240
       Environment:
         Variables:
           STACK_NAME_PREFIX: !Ref StackNamePrefix
