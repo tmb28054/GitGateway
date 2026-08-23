@@ -607,6 +607,15 @@ def _index_repo_tree(repo_path: Path, group: str, repo_name: str) -> None:
         except Exception as exc:  # pylint: disable=broad-except
             LOG.error("Error indexing tree for %s: %s", branch, exc)
 
+        # Index commit history for this branch
+        try:
+            _index_commit_history(
+                repo.object_store, table, group, repo_name, branch,
+                sha.encode(),
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.error("Error indexing commits for %s: %s", branch, exc)
+
 
 def _index_tree_recursive(
     object_store,
@@ -672,3 +681,74 @@ def _index_tree_recursive(
                 "last_commit_message": commit_message,
                 "last_commit_author": commit_author,
             })
+
+
+def _index_commit_history(
+    object_store,
+    table,
+    group: str,
+    repo_name: str,
+    branch: str,
+    head_sha: bytes,
+    max_commits: int = 100,
+) -> None:
+    """Walk commit history and store in DynamoDB.
+
+    Stores commits with COMMITS# prefix, sorted by timestamp.
+
+    Args:
+        object_store: Dulwich object store.
+        table: DynamoDB table resource.
+        group: Group name.
+        repo_name: Repository name.
+        branch: Branch name.
+        head_sha: SHA of the HEAD commit.
+        max_commits: Maximum commits to index.
+    """
+    visited = set()
+    queue = [head_sha]
+    count = 0
+
+    while queue and count < max_commits:
+        sha = queue.pop(0)
+        if sha in visited:
+            continue
+        visited.add(sha)
+
+        try:
+            commit = object_store[sha]
+            if commit.type_name != b"commit":
+                continue
+        except KeyError:
+            continue
+
+        sha_str = sha.decode() if isinstance(sha, bytes) else sha
+        message = commit.message.decode(errors="replace").strip()
+        subject = message.split("\n")[0]
+        author_raw = commit.author.decode(errors="replace")
+        author_name = author_raw.split(" <")[0]
+        author_email = ""
+        if "<" in author_raw and ">" in author_raw:
+            author_email = author_raw.split("<")[1].split(">")[0]
+
+        # Use commit time for sort order (zero-padded for lexicographic sort)
+        commit_time = commit.commit_time
+        time_key = f"{9999999999 - commit_time:010d}"
+
+        table.put_item(Item={
+            "PK": f"COMMITS#{group}/{repo_name}#{branch}",
+            "SK": f"COMMIT#{time_key}#{sha_str[:12]}",
+            "sha": sha_str,
+            "message": subject,
+            "full_message": message,
+            "author": author_name,
+            "author_email": author_email,
+            "timestamp": int(commit_time),
+        })
+
+        count += 1
+
+        # Add parents to queue
+        for parent_sha in commit.parents:
+            if parent_sha not in visited:
+                queue.append(parent_sha)

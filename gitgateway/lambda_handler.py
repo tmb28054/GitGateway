@@ -909,6 +909,12 @@ def _get_page_content(path: str, user_info: dict) -> str:
         if len(parts) == 2:
             return _render_repo_settings_page(parts[0], parts[1], username)
 
+    # /groups/<group>/<repo>/commits — commit history
+    if path.startswith("/groups/") and path.endswith("/commits"):
+        parts = path[8:].rsplit("/commits", 1)[0].split("/", 1)
+        if len(parts) == 2:
+            return _render_commits_page(parts[0], parts[1], username)
+
     # /groups/<group>/<repo>/tree/<branch>/... — file tree at branch
     if "/tree/" in path and path.startswith("/groups/"):
         # Parse /groups/<group>/<repo>/tree/<branch>[/path...]
@@ -984,6 +990,125 @@ def _render_user_groups_page(username: str) -> str:
         </tr>
       </thead>
       <tbody id="user-groups-table">
+        {rows}
+      </tbody>
+    </table>"""
+
+
+def _render_commits_page(
+    group: str, repo_name: str, username: str,
+) -> str:
+    """Render the commits history page for a repository.
+
+    Shows all commits on the default branch, sorted newest first.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        username: Authenticated user.
+
+    Returns:
+        HTML content.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+    import time as _time  # pylint: disable=import-outside-toplevel
+    from gitgateway.db import (  # pylint: disable=import-outside-toplevel
+        get_repo, check_permission,
+    )
+    from gitgateway.models import AccessLevel  # pylint: disable=import-outside-toplevel
+
+    if not check_permission(username, group, repo_name):
+        return "<h1>403 Forbidden</h1>"
+
+    try:
+        repo = get_repo(group, repo_name)
+    except Exception:  # pylint: disable=broad-except
+        return "<h1>404 Not Found</h1>"
+
+    default_branch = repo.default_branch or "main"
+    is_admin = check_permission(
+        username, group, repo_name, required_level=AccessLevel.ADMIN,
+    )
+
+    # Get commits from DynamoDB
+    table = boto3.resource("dynamodb").Table("gitgateway-repos")
+    response = table.query(
+        KeyConditionExpression=(
+            "PK = :pk AND begins_with(SK, :prefix)"
+        ),
+        ExpressionAttributeValues={
+            ":pk": f"COMMITS#{group}/{repo_name}#{default_branch}",
+            ":prefix": "COMMIT#",
+        },
+    )
+    commits = response.get("Items", [])
+
+    # Build commit rows
+    rows = ""
+    for commit in commits:
+        sha = commit.get("sha", "")
+        short_sha = sha[:7]
+        message = commit.get("message", "")
+        author = commit.get("author", "")
+        timestamp = int(commit.get("timestamp", 0))
+        if timestamp:
+            date_str = _time.strftime(
+                "%b %d, %Y", _time.gmtime(timestamp),
+            )
+        else:
+            date_str = ""
+
+        rows += f"""<tr style="border-bottom:1px solid #f0f0f0;">
+          <td style="padding:0.75rem;">
+            <div style="font-weight:600;">{message}</div>
+            <div style="color:#586069;font-size:0.85rem;margin-top:0.2rem;">
+              {author} committed {date_str}</div>
+          </td>
+          <td style="padding:0.75rem;text-align:right;">
+            <code style="background:#f6f8fa;padding:0.2rem 0.5rem;
+              border-radius:3px;font-size:0.8rem;">{short_sha}</code>
+          </td>
+        </tr>"""
+
+    if not rows:
+        rows = """<tr><td colspan="2" style="padding:2rem;color:#586069;
+          text-align:center;">No commits yet.</td></tr>"""
+
+    # Settings gear
+    settings_link = ""
+    if is_admin:
+        settings_link = (
+            f'<a href="/groups/{group}/{repo_name}/settings" '
+            f'title="Settings" style="font-size:1.2rem;">⚙️</a>'
+        )
+
+    return f"""
+    <div style="display:flex;justify-content:space-between;
+      align-items:center;margin-bottom:1rem;">
+      <h1 style="margin:0;">
+        <a href="/groups/{group}" style="color:#586069;
+          font-weight:normal;">{group}</a> /
+        <a href="/groups/{group}/{repo_name}">{repo_name}</a>
+      </h1>
+      {settings_link}
+    </div>
+
+    <div style="display:flex;gap:1rem;border-bottom:1px solid #e1e4e8;
+      margin-bottom:1.5rem;">
+      <a href="/groups/{group}/{repo_name}"
+        style="padding:0.5rem 1rem;color:#586069;">Code</a>
+      <a href="/groups/{group}/{repo_name}/pulls"
+        style="padding:0.5rem 1rem;color:#586069;">Pull Requests</a>
+      <a href="/groups/{group}/{repo_name}/commits"
+        style="padding:0.5rem 1rem;font-weight:600;
+        border-bottom:2px solid #f9826c;">Commits</a>
+    </div>
+
+    <h2>Commits on <code>{default_branch}</code></h2>
+
+    <table style="width:100%;border-collapse:collapse;margin-top:1rem;
+      border:1px solid #e1e4e8;border-radius:6px;">
+      <tbody>
         {rows}
       </tbody>
     </table>"""
@@ -1249,6 +1374,8 @@ def _render_file_viewer(  # pylint: disable=too-many-positional-arguments
         border-bottom:2px solid #f9826c;">Code</a>
       <a href="/groups/{group}/{repo_name}/pulls"
         style="padding:0.5rem 1rem;color:#586069;">Pull Requests</a>
+      <a href="/groups/{group}/{repo_name}/commits"
+        style="padding:0.5rem 1rem;color:#586069;">Commits</a>
     </div>
 
     <div style="margin-bottom:1rem;color:#586069;font-size:0.9rem;">
@@ -1612,6 +1739,8 @@ git push -u origin main</pre>
         border-bottom:2px solid #f9826c;">Code</a>
       <a href="/groups/{group}/{repo_name}/pulls"
         style="padding:0.5rem 1rem;color:#586069;">Pull Requests</a>
+      <a href="/groups/{group}/{repo_name}/commits"
+        style="padding:0.5rem 1rem;color:#586069;">Commits</a>
     </div>
 
     <div style="display:flex;justify-content:space-between;
