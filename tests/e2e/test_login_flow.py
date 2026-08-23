@@ -35,7 +35,7 @@ def _solve_challenge(page: Page) -> None:
 
     # Parse "What is X + Y?" or "What is X - Y?" etc.
     import re  # pylint: disable=import-outside-toplevel
-    match = re.search(r"(\d+)\s*([+\-*/])\s*(\d+)", question)
+    match = re.search(r"(\d+)\s*([+\-*×÷/])\s*(\d+)", question)
     if not match:
         return
 
@@ -47,9 +47,9 @@ def _solve_challenge(page: Page) -> None:
         answer = num1 + num2
     elif operator == "-":
         answer = num1 - num2
-    elif operator == "*":
+    elif operator in ("*", "×"):
         answer = num1 * num2
-    elif operator == "/":
+    elif operator in ("/", "÷"):
         answer = num1 // num2
     else:
         return
