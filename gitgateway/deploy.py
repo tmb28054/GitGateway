@@ -76,13 +76,16 @@ def package_lambda(output_dir: Path | None = None) -> Path:
 
     # Install dependencies into build dir
     requirements = [
+        "bandit",
         "dulwich",
         "jinja2",
         "markdown",
         "pygments",
+        "pylint",
         "pyjwt[crypto]",
         "cryptography",
         "requests",
+        "yamllint",
     ]
 
     try:

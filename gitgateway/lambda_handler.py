@@ -657,6 +657,13 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
             group=pr_group,
             repo=pr_repo,
         ))
+
+        # Run linters on the source branch (best effort, limited scope)
+        try:
+            _run_pr_linting(pr_group, pr_repo, pr.number, pr.source_branch)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.warning("Linting failed for PR #%d: %s", pr.number, exc)
+
         return Response(
             status_code=201,
             body=json.dumps(pr.to_dict()),
@@ -3454,6 +3461,106 @@ def _handle_auth_callback(request: Request, idp_url: str) -> Response:
                 f"Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600"
             ),
         },
+    )
+
+
+def _run_pr_linting(
+    group: str, repo_name: str, pr_number: int, source_branch: str,
+) -> None:
+    """Run linters on a PR's source branch and post results.
+
+    Reads all files from the DynamoDB tree cache for the source branch,
+    runs all applicable linters, and posts a status check + comment.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        pr_number: The PR number.
+        source_branch: Branch to lint.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+    from gitgateway.lint import run_all_linters  # pylint: disable=import-outside-toplevel
+    from gitgateway.status_checks import (  # pylint: disable=import-outside-toplevel
+        post_status, StatusCheck, CheckStatus,
+    )
+    from gitgateway.reviews import add_comment, Comment  # pylint: disable=import-outside-toplevel
+
+    # Get files from DynamoDB tree cache
+    table = boto3.resource("dynamodb").Table("gitgateway-repos")
+    response = table.query(
+        KeyConditionExpression=(
+            "PK = :pk AND begins_with(SK, :prefix)"
+        ),
+        ExpressionAttributeValues={
+            ":pk": f"TREE#{group}/{repo_name}#{source_branch}",
+            ":prefix": "FILE#",
+        },
+    )
+    items = response.get("Items", [])
+
+    if not items:
+        LOG.info("No files in tree cache for %s/%s#%s, skipping lint",
+                 group, repo_name, source_branch)
+        return
+
+    # Build files dict
+    files = {}
+    for item in items:
+        path = item.get("path", "")
+        content = item.get("content", "")
+        if path and content:
+            files[path] = content
+
+    if not files:
+        return
+
+    # Limit total content size to avoid timeout (max 200KB of files)
+    total_size = sum(len(c) for c in files.values())
+    if total_size > 200_000:
+        # Only lint smaller files to stay within Lambda timeout
+        small_files = {
+            p: c for p, c in files.items() if len(c) < 20_000
+        }
+        files = dict(list(small_files.items())[:20])
+
+    if not files:
+        return
+
+    # Run linters
+    result = run_all_linters(files)
+
+    # Post status check
+    check_status = CheckStatus.SUCCESS if result.passed else CheckStatus.FAILURE
+    post_status(StatusCheck(
+        name="lint",
+        status=check_status,
+        description=result.summary,
+        pr_number=pr_number,
+        group=group,
+        repo=repo_name,
+    ))
+
+    # Post findings as a comment if there are any
+    if result.findings:
+        findings_text = f"**Lint Results: {'PASSED' if result.passed else 'FAILED'}**\n\n"
+        findings_text += f"{result.summary}\n\n"
+        for f in result.findings[:50]:  # Limit to 50 findings
+            findings_text += f"- `{f.file_path}:{f.line}` [{f.tool}] {f.message}\n"
+        if len(result.findings) > 50:
+            findings_text += f"\n... and {len(result.findings) - 50} more findings"
+
+        add_comment(Comment(
+            pr_number=pr_number,
+            author="gitgateway-lint",
+            body=findings_text,
+            group=group,
+            repo=repo_name,
+        ))
+
+    LOG.info(
+        "Lint for PR #%d: %s (%d findings)",
+        pr_number, "PASSED" if result.passed else "FAILED",
+        len(result.findings),
     )
 
 
