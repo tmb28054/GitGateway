@@ -8,8 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Comprehensive project documentation across all docs/ files.
-- Steering rule for verbose documentation standards.
+- GitHub-style repository view with Code/Pull Requests tabs, clone URL box, branch selector dropdown, and file tree from DynamoDB cache showing last commit info per file.
+- File viewer with Pygments syntax highlighting, line numbers, copy button, and breadcrumb navigation when clicking files in the repo tree.
+- Repository settings page (admin-only) with default branch override, description editing, and Danger Zone with delete repository button.
+- Branch switching with dropdown populated from DynamoDB branch entries, different branches show different file trees, branches API for registering branches.
+- Admin Access Control page with grant form (known users dropdown + free-text username + group select + level select) and revoke button with confirmation.
+- Admin navigation link visible on all pages for admin users, pointing to /admin hub with links to Manage Groups and Access Control.
+- View Groups page (/groups) showing only groups the authenticated user has been granted access to.
+- Group detail page (/groups/<name>) with repository listing and create repository form for contributors and admins.
+- Comprehensive project documentation across all docs/ files (architecture, CLI, API, deployment, configuration, authentication, PRs, SAST, AI, LFS, mirroring, FAQ).
+- Steering rule for verbose and comprehensive documentation standards.
+- Playwright end-to-end integration tests for login flow, admin groups, admin access control, nav admin link, view groups, group repos, repo view, file viewer, repo settings, and branch switching.
+- Full deployment pipeline: Lambda code packaging with pip dependencies for Linux, S3 upload, CloudFormation stack with Lambda function, API Gateway integration/routes/stage, IAM execution role, and 10GB /tmp.
+- Working OAuth flow: unauthenticated visitors redirected to IdP, callback sets session cookie, authenticated users see the web UI with nav bar (username + logout + admin link for admins).
+- REST API endpoints for groups CRUD, repos CRUD, access control grant/revoke/list, repo settings PATCH, branches register/list, known users list.
+- CLI wired to make real HTTP API calls against deployed GitGateway (group/repo/access/PR management).
+- IdP programmatic login helper with unicode math challenge support (×, ÷).
+
+### Fixed
+- Unicode multiplication (×) and division (÷) signs in IdP math challenges now handled correctly in all test helpers.
+- CloudFront origin request policy forwarding cookies to Lambda for session-based auth.
+- API Gateway v2 cookies array parsed into request headers for session detection.
+- Branch dropdown routing order fixed so /branches endpoints match before generic repo POST.
 
 ## [0.1.0] - 2025-08-21
 
