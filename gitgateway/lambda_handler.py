@@ -463,6 +463,45 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
             headers=headers,
         )
 
+    # PATCH /api/repos/<group>/<repo>/settings — update repo settings
+    if (
+        path.startswith("/api/repos/")
+        and path.endswith("/settings")
+        and method == "PATCH"
+    ):
+        settings_path = path[len("/api/repos/"):-len("/settings")]
+        parts = settings_path.split("/", 1)
+        if len(parts) == 2:
+            from gitgateway.db import (  # pylint: disable=import-outside-toplevel
+                get_repo, update_repo,
+            )
+            try:
+                body = json.loads(request.body.decode()) if request.body else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return Response(
+                    status_code=400,
+                    body=json.dumps({"error": "Invalid JSON"}),
+                    headers=headers,
+                )
+            try:
+                repo = get_repo(parts[0], parts[1])
+            except NotFoundError:
+                return Response(
+                    status_code=404,
+                    body=json.dumps({"error": "Repository not found"}),
+                    headers=headers,
+                )
+            if "default_branch" in body:
+                repo.default_branch = body["default_branch"]
+            if "description" in body:
+                repo.description = body["description"]
+            update_repo(repo)
+            return Response(
+                status_code=200,
+                body=json.dumps(repo.to_dict()),
+                headers=headers,
+            )
+
     # DELETE /api/repos/<group>/<repo> — delete repo
     if path.startswith("/api/repos/") and method == "DELETE" and path.count("/") >= 4:
         parts = path[len("/api/repos/"):].split("/", 1)
@@ -725,6 +764,12 @@ def _get_page_content(path: str, user_info: dict) -> str:
         parts = path[8:].split("/")
         return _render_repo_page(parts[0], parts[1], username, "")
 
+    # /groups/<group>/<repo>/settings — repo settings
+    if path.startswith("/groups/") and path.endswith("/settings"):
+        parts = path[8:].rsplit("/settings", 1)[0].split("/", 1)
+        if len(parts) == 2:
+            return _render_repo_settings_page(parts[0], parts[1], username)
+
     # /groups/<group>/<repo>/tree/<branch>/... — file tree at branch
     if "/tree/" in path and path.startswith("/groups/"):
         # Parse /groups/<group>/<repo>/tree/<branch>[/path...]
@@ -803,6 +848,132 @@ def _render_user_groups_page(username: str) -> str:
         {rows}
       </tbody>
     </table>"""
+
+
+def _render_repo_settings_page(
+    group: str, repo_name: str, username: str,
+) -> str:
+    """Render the repository settings page.
+
+    Only accessible to admin users. Allows changing the default branch.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        username: Authenticated user.
+
+    Returns:
+        HTML content.
+    """
+    from gitgateway.db import (  # pylint: disable=import-outside-toplevel
+        get_repo, check_permission,
+    )
+    from gitgateway.models import AccessLevel  # pylint: disable=import-outside-toplevel
+
+    if not check_permission(
+        username, group, repo_name, required_level=AccessLevel.ADMIN,
+    ):
+        return "<h1>403 Forbidden</h1><p>Admin access required.</p>"
+
+    try:
+        repo = get_repo(group, repo_name)
+    except Exception:  # pylint: disable=broad-except
+        return "<h1>404 Not Found</h1>"
+
+    default_branch = repo.default_branch or "main"
+
+    return f"""
+    <div style="margin-bottom:1.5rem;">
+      <h1>
+        <a href="/groups/{group}" style="color:#586069;
+          font-weight:normal;">{group}</a> /
+        <a href="/groups/{group}/{repo_name}">{repo_name}</a>
+        / Settings
+      </h1>
+    </div>
+
+    <div style="border:1px solid #e1e4e8;border-radius:6px;padding:1.5rem;
+      max-width:600px;">
+      <h2 style="margin-bottom:1rem;">General</h2>
+
+      <form id="settings-form" onsubmit="saveSettings(event)">
+        <div style="margin-bottom:1.5rem;">
+          <label for="default-branch" style="display:block;
+            font-weight:600;margin-bottom:0.3rem;">
+            Default Branch</label>
+          <p style="color:#586069;font-size:0.85rem;margin-bottom:0.5rem;">
+            The branch shown by default when viewing this repository.</p>
+          <input type="text" id="default-branch" name="default_branch"
+            value="{default_branch}" required
+            style="padding:0.5rem 0.75rem;border:1px solid #d1d5da;
+            border-radius:4px;width:200px;">
+        </div>
+
+        <div style="margin-bottom:1.5rem;">
+          <label for="repo-description" style="display:block;
+            font-weight:600;margin-bottom:0.3rem;">
+            Description</label>
+          <input type="text" id="repo-description" name="description"
+            value="{repo.description}"
+            placeholder="Short description of this repository"
+            style="padding:0.5rem 0.75rem;border:1px solid #d1d5da;
+            border-radius:4px;width:100%;">
+        </div>
+
+        <button type="submit"
+          style="background:#2ea44f;color:#fff;border:none;
+          padding:0.5rem 1.2rem;border-radius:4px;cursor:pointer;
+          font-size:0.9rem;">Save Settings</button>
+      </form>
+      <div id="settings-message" style="margin-top:0.75rem;
+        font-size:0.85rem;"></div>
+    </div>
+
+    <div style="border:1px solid #cb2431;border-radius:6px;
+      padding:1.5rem;max-width:600px;margin-top:2rem;">
+      <h2 style="color:#cb2431;margin-bottom:0.5rem;">Danger Zone</h2>
+      <p style="color:#586069;font-size:0.85rem;margin-bottom:1rem;">
+        Permanently delete this repository and all its data.</p>
+      <button onclick="deleteRepo()"
+        style="background:#cb2431;color:#fff;border:none;
+        padding:0.5rem 1.2rem;border-radius:4px;cursor:pointer;">
+        Delete Repository</button>
+    </div>
+
+    <script>
+    async function saveSettings(e) {{
+      e.preventDefault();
+      const defaultBranch = document.getElementById('default-branch').value;
+      const description = document.getElementById('repo-description').value;
+      const msg = document.getElementById('settings-message');
+
+      const resp = await fetch('/api/repos/{group}/{repo_name}/settings', {{
+        method: 'PATCH',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{default_branch: defaultBranch, description}})
+      }});
+
+      if (resp.ok) {{
+        msg.innerHTML = '<span style="color:#2ea44f;">Settings saved!</span>';
+      }} else {{
+        const data = await resp.json();
+        msg.innerHTML = '<span style="color:#cb2431;">'
+          + (data.error || 'Failed') + '</span>';
+      }}
+    }}
+
+    async function deleteRepo() {{
+      if (!confirm('Are you sure? This cannot be undone.')) return;
+      const resp = await fetch('/api/repos/{group}/{repo_name}', {{
+        method: 'DELETE'
+      }});
+      if (resp.ok || resp.status === 204) {{
+        window.location.href = '/groups/{group}';
+      }} else {{
+        alert('Failed to delete repository');
+      }}
+    }}
+    </script>"""
 
 
 def _render_repo_tree_or_file(
