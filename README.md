@@ -84,3 +84,4 @@ GitGateway uses a fully serverless architecture on AWS:
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
