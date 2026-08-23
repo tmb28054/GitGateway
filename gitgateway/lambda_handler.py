@@ -913,6 +913,17 @@ def _get_page_content(path: str, user_info: dict) -> str:
         if len(parts) == 2:
             return _render_repo_settings_page(parts[0], parts[1], username)
 
+    # /groups/<group>/<repo>/commit/<sha> — view commit diff
+    if path.startswith("/groups/") and "/commit/" in path:
+        after = path[8:]
+        parts = after.split("/commit/", 1)
+        if len(parts) == 2:
+            gr_parts = parts[0].split("/", 1)
+            if len(gr_parts) == 2:
+                return _render_commit_diff_page(
+                    gr_parts[0], gr_parts[1], username, parts[1],
+                )
+
     # /groups/<group>/<repo>/commits — commit history (not inside /tree/)
     # Also handles /groups/<group>/<repo>/commits/<branch>
     if (
@@ -1013,6 +1024,230 @@ def _render_user_groups_page(username: str) -> str:
     </table>"""
 
 
+def _render_commit_diff_page(
+    group: str, repo_name: str, username: str, sha: str,
+) -> str:
+    """Render a commit's diff page.
+
+    Shows the commit message, metadata, and file changes.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        username: Authenticated user.
+        sha: The commit SHA.
+
+    Returns:
+        HTML content.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+    import time as _time  # pylint: disable=import-outside-toplevel
+    from pathlib import Path as _Path  # pylint: disable=import-outside-toplevel
+    import tempfile as _tempfile  # pylint: disable=import-outside-toplevel
+    from dulwich.repo import Repo as _Repo  # pylint: disable=import-outside-toplevel
+    from gitgateway.db import check_permission  # pylint: disable=import-outside-toplevel
+    from gitgateway.storage import (  # pylint: disable=import-outside-toplevel
+        sync_repo_to_local, repo_exists,
+    )
+
+    if not check_permission(username, group, repo_name):
+        return "<h1>403 Forbidden</h1>"
+
+    # Sync repo to get the commit objects
+    local_base = _Path(_tempfile.gettempdir()) / "gitgateway"
+    local_base.mkdir(parents=True, exist_ok=True)
+    local_path = local_base / group / f"{repo_name}.git"
+
+    if not repo_exists(group, repo_name):
+        return "<h1>404 Not Found</h1>"
+
+    try:
+        sync_repo_to_local(group, repo_name, local_base=local_base)
+        repo = _Repo(str(local_path))
+    except Exception:  # pylint: disable=broad-except
+        return "<h1>500 Error</h1><p>Could not load repository.</p>"
+
+    # Get the commit
+    try:
+        commit = repo.object_store[sha.encode()]
+    except KeyError:
+        return f"<h1>404 Not Found</h1><p>Commit {sha[:7]} not found.</p>"
+
+    message = commit.message.decode(errors="replace")
+    subject = message.split("\n")[0]
+    body = "\n".join(message.split("\n")[1:]).strip()
+    author = commit.author.decode(errors="replace").split(" <")[0]
+    commit_time = commit.commit_time
+    date_str = _time.strftime("%b %d, %Y %H:%M:%S UTC", _time.gmtime(commit_time))
+
+    # Compute diff against parent
+    diff_html = ""
+    parent_tree = None
+    if commit.parents:
+        try:
+            parent = repo.object_store[commit.parents[0]]
+            parent_tree = parent.tree
+        except KeyError:
+            pass
+
+    current_tree = commit.tree
+
+    # Walk both trees and find differences
+    diff_entries = _compute_tree_diff(
+        repo.object_store, parent_tree, current_tree,
+    )
+
+    for entry in diff_entries:
+        status_badge = {
+            "added": '<span style="background:#2ea44f;color:#fff;padding:0.1rem 0.4rem;border-radius:3px;font-size:0.75rem;">Added</span>',
+            "deleted": '<span style="background:#cb2431;color:#fff;padding:0.1rem 0.4rem;border-radius:3px;font-size:0.75rem;">Deleted</span>',
+            "modified": '<span style="background:#dbab09;color:#fff;padding:0.1rem 0.4rem;border-radius:3px;font-size:0.75rem;">Modified</span>',
+        }.get(entry["status"], "")
+
+        diff_content = ""
+        if entry.get("diff"):
+            escaped_diff = entry["diff"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            lines = escaped_diff.split("\n")
+            colored_lines = []
+            for line in lines:
+                if line.startswith("+"):
+                    colored_lines.append(f'<span style="background:#e6ffed;">{line}</span>')
+                elif line.startswith("-"):
+                    colored_lines.append(f'<span style="background:#ffeef0;">{line}</span>')
+                else:
+                    colored_lines.append(line)
+            diff_content = "\n".join(colored_lines)
+
+        diff_html += f"""
+        <div style="border:1px solid #e1e4e8;border-radius:6px;margin-bottom:1rem;">
+          <div style="background:#f6f8fa;padding:0.5rem 1rem;
+            border-bottom:1px solid #e1e4e8;display:flex;
+            justify-content:space-between;align-items:center;">
+            <strong>{entry["path"]}</strong>
+            {status_badge}
+          </div>
+          <pre style="margin:0;padding:1rem;font-size:0.8rem;
+            overflow-x:auto;line-height:1.5;">{diff_content}</pre>
+        </div>"""
+
+    if not diff_html:
+        diff_html = '<p style="color:#586069;">No file changes in this commit.</p>'
+
+    return f"""
+    <div style="margin-bottom:1rem;">
+      <h1 style="margin:0;">
+        <a href="/groups/{group}" style="color:#586069;
+          font-weight:normal;">{group}</a> /
+        <a href="/groups/{group}/{repo_name}">{repo_name}</a>
+      </h1>
+    </div>
+
+    <div style="border:1px solid #e1e4e8;border-radius:6px;
+      padding:1.5rem;margin-bottom:1.5rem;">
+      <h2 style="margin:0 0 0.5rem;">{subject}</h2>
+      {'<pre style="color:#586069;margin:0.5rem 0;white-space:pre-wrap;">' + body + '</pre>' if body else ''}
+      <div style="color:#586069;font-size:0.85rem;margin-top:0.75rem;">
+        <strong>{author}</strong> committed on {date_str}
+        &middot; <code style="background:#f6f8fa;padding:0.2rem 0.4rem;
+          border-radius:3px;">{sha[:7]}</code>
+      </div>
+    </div>
+
+    <h3 style="margin-bottom:1rem;">Files changed</h3>
+    {diff_html}
+
+    <div style="margin-top:1.5rem;">
+      <a href="/groups/{group}/{repo_name}/commits"
+        style="color:#0366d6;">&larr; Back to commits</a>
+    </div>"""
+
+
+def _compute_tree_diff(object_store, old_tree_sha, new_tree_sha) -> list[dict]:
+    """Compute differences between two trees.
+
+    Args:
+        object_store: Dulwich object store.
+        old_tree_sha: SHA of the old tree (None for initial commit).
+        new_tree_sha: SHA of the new tree.
+
+    Returns:
+        List of dicts with 'path', 'status', and 'diff' keys.
+    """
+    old_entries = {}
+    new_entries = {}
+
+    if old_tree_sha:
+        _flatten_tree(object_store, old_tree_sha, "", old_entries)
+    _flatten_tree(object_store, new_tree_sha, "", new_entries)
+
+    diffs = []
+    all_paths = sorted(set(list(old_entries.keys()) + list(new_entries.keys())))
+
+    for path in all_paths:
+        old_sha = old_entries.get(path)
+        new_sha = new_entries.get(path)
+
+        if old_sha is None:
+            # Added
+            content = _get_blob_text(object_store, new_sha)
+            diff_text = "\n".join(f"+{line}" for line in content.split("\n")) if content else ""
+            diffs.append({"path": path, "status": "added", "diff": diff_text})
+        elif new_sha is None:
+            # Deleted
+            content = _get_blob_text(object_store, old_sha)
+            diff_text = "\n".join(f"-{line}" for line in content.split("\n")) if content else ""
+            diffs.append({"path": path, "status": "deleted", "diff": diff_text})
+        elif old_sha != new_sha:
+            # Modified
+            old_content = _get_blob_text(object_store, old_sha)
+            new_content = _get_blob_text(object_store, new_sha)
+            diff_text = _simple_diff(old_content, new_content)
+            diffs.append({"path": path, "status": "modified", "diff": diff_text})
+
+    return diffs
+
+
+def _flatten_tree(object_store, tree_sha, prefix: str, result: dict) -> None:
+    """Flatten a tree into a dict of path -> blob SHA."""
+    try:
+        tree = object_store[tree_sha]
+    except KeyError:
+        return
+    for item in tree.items():
+        name = item.path.decode(errors="replace")
+        full_path = f"{prefix}/{name}" if prefix else name
+        mode = item.mode
+        if (mode & 0o170000) == 0o040000:
+            _flatten_tree(object_store, item.sha, full_path, result)
+        else:
+            result[full_path] = item.sha
+
+
+def _get_blob_text(object_store, sha) -> str:
+    """Get blob content as text (max 100KB)."""
+    try:
+        blob = object_store[sha]
+        raw = blob.as_raw_string()
+        if len(raw) > 100_000:
+            return "(file too large to display)"
+        return raw.decode(errors="replace")
+    except (KeyError, Exception):  # pylint: disable=broad-except
+        return ""
+
+
+def _simple_diff(old: str, new: str) -> str:
+    """Generate a simple unified-style diff between two strings."""
+    old_lines = old.split("\n")
+    new_lines = new.split("\n")
+
+    # Simple line-by-line diff
+    import difflib  # pylint: disable=import-outside-toplevel
+    diff = difflib.unified_diff(
+        old_lines, new_lines, lineterm="", n=3,
+    )
+    return "\n".join(diff)
+
+
 def _render_commits_page(
     group: str, repo_name: str, username: str, branch: str = "",
 ) -> str:
@@ -1103,9 +1338,12 @@ def _render_commits_page(
             <div style="color:#586069;font-size:0.85rem;margin-top:0.2rem;">
               {author} committed {date_str}</div>
           </td>
-          <td style="padding:0.75rem;text-align:right;">
-            <code style="background:#f6f8fa;padding:0.2rem 0.5rem;
-              border-radius:3px;font-size:0.8rem;">{short_sha}</code>
+          <td style="padding:0.75rem;text-align:right;white-space:nowrap;">
+            <a href="/groups/{group}/{repo_name}/commit/{sha}"
+              style="background:#f6f8fa;padding:0.2rem 0.5rem;
+              border:1px solid #e1e4e8;border-radius:3px;
+              font-size:0.8rem;font-family:monospace;
+              text-decoration:none;color:#24292e;">{short_sha}</a>
           </td>
         </tr>"""
 
