@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}PR #{{ pr.number }} - {{ pr.title }} - GitGateway{% endblock %}
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: flex-start;">
+    <div>
+        <h1 style="margin-bottom: 0.25rem;">{{ pr.title }} <span style="color: #586069; font-weight: normal;">#{{ pr.number }}</span></h1>
+        <div style="display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem;">
+            <span class="btn {% if pr.status == 'open' %}btn-primary{% else %}btn-secondary{% endif %}" style="font-size: 0.8rem;">
+                {{ pr.status | capitalize }}
+            </span>
+            <span style="color: #586069;">{{ pr.author }} wants to merge <code>{{ pr.source_branch }}</code> into <code>{{ pr.target_branch }}</code></span>
+        </div>
+    </div>
+    {% if pr.status == 'open' and can_merge %}
+    <form method="post" action="/{{ repo.group }}/{{ repo.name }}/pulls/{{ pr.number }}/merge">
+        <button type="submit" class="btn btn-primary" {% if not checks_passing %}disabled{% endif %}>
+            {% if checks_passing %}Merge Pull Request{% else %}Checks pending...{% endif %}
+        </button>
+    </form>
+    {% endif %}
+</div>
+
+{% if pr.description %}
+<div style="background: #f6f8fa; padding: 1rem; border-radius: 6px; margin: 1.5rem 0;">
+    {{ pr.description }}
+</div>
+{% endif %}
+
+{% if status_checks %}
+<div style="margin: 1.5rem 0;">
+    <h3>Status Checks</h3>
+    <ul style="list-style: none; padding: 0;">
+        {% for check in status_checks %}
+        <li style="padding: 0.5rem 0; display: flex; align-items: center; gap: 0.5rem;">
+            <span style="color: {% if check.status == 'success' %}#2ea44f{% elif check.status == 'failure' %}#cb2431{% else %}#dbab09{% endif %};">
+                {% if check.status == 'success' %}✓{% elif check.status == 'failure' %}✗{% else %}●{% endif %}
+            </span>
+            <span>{{ check.name }}</span>
+            {% if check.description %}<span style="color: #586069; font-size: 0.85rem;">— {{ check.description }}</span>{% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+{% if reviews %}
+<div style="margin: 1.5rem 0;">
+    <h3>Reviews</h3>
+    {% for review in reviews %}
+    <div style="padding: 0.5rem 0; border-bottom: 1px solid #f0f0f0;">
+        <strong>{{ review.author }}</strong>
+        <span style="color: {% if review.status == 'approved' %}#2ea44f{% elif review.status == 'changes_requested' %}#cb2431{% else %}#586069{% endif %};">
+            {% if review.status == 'approved' %}approved{% elif review.status == 'changes_requested' %}requested changes{% else %}commented{% endif %}
+        </span>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+
+<div style="margin-top: 2rem;">
+    <a href="/{{ repo.group }}/{{ repo.name }}/pulls/{{ pr.number }}/diff" class="btn btn-secondary">View Diff</a>
+</div>
+{% endblock %}

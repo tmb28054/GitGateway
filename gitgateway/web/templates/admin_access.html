@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Access Control{% if resource %} - {{ resource }}{% endif %} - GitGateway{% endblock %}
+{% block content %}
+<h1>Access Control{% if resource %}: {{ resource }}{% endif %}</h1>
+<table style="width: 100%; border-collapse: collapse; margin-top: 1rem;">
+    <thead><tr style="border-bottom: 1px solid #e1e4e8;">
+        <th style="text-align: left; padding: 0.5rem;">User</th>
+        <th style="text-align: left; padding: 0.5rem;">Resource</th>
+        <th style="text-align: left; padding: 0.5rem;">Level</th>
+        <th style="padding: 0.5rem;">Actions</th>
+    </tr></thead>
+    <tbody>
+    {% for user in users %}
+    <tr style="border-bottom: 1px solid #f0f0f0;">
+        <td style="padding: 0.5rem;">{{ user.username }}</td>
+        <td style="padding: 0.5rem; color: #586069;">{{ user.resource }}</td>
+        <td style="padding: 0.5rem;">
+            <span class="btn btn-secondary" style="font-size: 0.75rem;">{{ user.level }}</span>
+        </td>
+        <td style="padding: 0.5rem; text-align: center;">
+            <button class="btn btn-secondary" style="font-size: 0.8rem; color: #cb2431;"
+                hx-delete="/api/access/{{ user.username }}/{{ user.resource }}" hx-confirm="Revoke access?">
+                Revoke
+            </button>
+        </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% if not users %}
+<p style="color: #586069; margin-top: 2rem; text-align: center;">No access entries.</p>
+{% endif %}
+{% endblock %}

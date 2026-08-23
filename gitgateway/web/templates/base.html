@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}GitGateway{% endblock %}</title>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #24292e; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 0 1rem; }
+        nav { background: #24292e; color: white; padding: 0.75rem 0; }
+        nav .container { display: flex; align-items: center; justify-content: space-between; }
+        nav a { color: white; text-decoration: none; margin: 0 0.5rem; }
+        nav .brand { font-weight: bold; font-size: 1.2rem; }
+        .notification-badge { background: #e36209; border-radius: 50%; padding: 0.1rem 0.4rem; font-size: 0.75rem; }
+        main { padding: 2rem 0; }
+        .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; font-size: 0.875rem; cursor: pointer; border: 1px solid transparent; }
+        .btn-primary { background: #2ea44f; color: white; }
+        .btn-secondary { background: #fafbfc; border-color: #d1d5da; color: #24292e; }
+    </style>
+    {% block head %}{% endblock %}
+</head>
+<body>
+    {% block nav %}
+    <nav>
+        <div class="container">
+            <a href="/" class="brand">GitGateway</a>
+            <div>
+                {% if username %}
+                <a href="/notifications">
+                    Notifications
+                    {% if notifications_count > 0 %}
+                    <span class="notification-badge">{{ notifications_count }}</span>
+                    {% endif %}
+                </a>
+                <a href="/settings">{{ username }}</a>
+                {% else %}
+                <a href="/auth/login" class="btn btn-primary">Sign In</a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+    {% endblock %}
+    <main>
+        <div class="container">
+            {% block content %}{% endblock %}
+        </div>
+    </main>
+</body>
+</html>

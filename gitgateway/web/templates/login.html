@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Sign In - GitGateway{% endblock %}
+{% block nav %}{% endblock %}
+{% block content %}
+<div style="max-width: 400px; margin: 4rem auto; text-align: center;">
+    <h1>GitGateway</h1>
+    <p style="margin: 1rem 0; color: #586069;">Sign in to access your repositories</p>
+    {% if error %}
+    <div style="background: #ffeef0; border: 1px solid #fdaeb7; padding: 0.75rem; border-radius: 6px; margin: 1rem 0;">
+        {{ error }}
+    </div>
+    {% endif %}
+    <a href="{{ idp_url }}" class="btn btn-primary" style="display: block; margin-top: 2rem; padding: 0.75rem;">
+        Sign in with SSO
+    </a>
+</div>
+{% endblock %}

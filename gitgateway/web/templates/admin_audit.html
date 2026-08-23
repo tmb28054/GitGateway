@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Audit Log{% if resource %} - {{ resource }}{% endif %} - GitGateway{% endblock %}
+{% block content %}
+<h1>Audit Log{% if resource %}: {{ resource }}{% endif %}</h1>
+<table style="width: 100%; border-collapse: collapse; margin-top: 1rem;">
+    <thead><tr style="border-bottom: 1px solid #e1e4e8;">
+        <th style="text-align: left; padding: 0.5rem;">Time</th>
+        <th style="text-align: left; padding: 0.5rem;">Actor</th>
+        <th style="text-align: left; padding: 0.5rem;">Action</th>
+        <th style="text-align: left; padding: 0.5rem;">Resource</th>
+    </tr></thead>
+    <tbody>
+    {% for event in events %}
+    <tr style="border-bottom: 1px solid #f0f0f0;">
+        <td style="padding: 0.5rem; font-size: 0.85rem; color: #586069;">{{ event.timestamp }}</td>
+        <td style="padding: 0.5rem;">{{ event.actor }}</td>
+        <td style="padding: 0.5rem;"><code>{{ event.action }}</code></td>
+        <td style="padding: 0.5rem; color: #586069;">{{ event.resource }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% if not events %}
+<p style="color: #586069; margin-top: 2rem; text-align: center;">No audit events.</p>
+{% endif %}
+{% endblock %}

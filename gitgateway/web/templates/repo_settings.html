@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Settings - {{ repo.group }}/{{ repo.name }} - GitGateway{% endblock %}
+{% block content %}
+<h1>Repository Settings: {{ repo.group }}/{{ repo.name }}</h1>
+
+<section style="margin: 2rem 0;">
+    <h2>General</h2>
+    <form method="post" action="/{{ repo.group }}/{{ repo.name }}/settings">
+        <div style="margin: 1rem 0;">
+            <label for="description" style="display: block; font-weight: 600; margin-bottom: 0.25rem;">Description</label>
+            <input type="text" name="description" id="description" value="{{ repo.description }}" style="width: 100%; padding: 0.5rem; border: 1px solid #d1d5da; border-radius: 6px;">
+        </div>
+        <div style="margin: 1rem 0;">
+            <label style="display: flex; align-items: center; gap: 0.5rem;">
+                <input type="checkbox" name="ai_enabled" {% if repo.ai_enabled %}checked{% endif %}>
+                Enable AI features
+            </label>
+        </div>
+        <div style="margin: 1rem 0;">
+            <label style="display: flex; align-items: center; gap: 0.5rem;">
+                <input type="checkbox" name="sast_enabled" {% if repo.sast_enabled %}checked{% endif %}>
+                Enable SAST scanning
+            </label>
+        </div>
+        <button type="submit" class="btn btn-primary">Save</button>
+    </form>
+</section>
+
+<section style="margin: 2rem 0;">
+    <h2>Branch Protection</h2>
+    {% for bp in branch_protections %}
+    <div style="padding: 0.75rem; border: 1px solid #e1e4e8; border-radius: 6px; margin: 0.5rem 0;">
+        <strong>{{ bp.branch }}</strong>:
+        {{ bp.required_approvals }} approval(s) required
+        {% if not bp.force_push_allowed %}, no force push{% endif %}
+        {% if bp.require_linear_history %}, linear history{% endif %}
+    </div>
+    {% endfor %}
+    {% if not branch_protections %}
+    <p style="color: #586069;">No branch protections configured.</p>
+    {% endif %}
+</section>
+
+{% if mirror_config %}
+<section style="margin: 2rem 0;">
+    <h2>Mirror</h2>
+    <div style="padding: 0.75rem; border: 1px solid #e1e4e8; border-radius: 6px;">
+        <p><strong>Target:</strong> {{ mirror_config.target_url }}</p>
+        <p><strong>Status:</strong> {{ mirror_config.last_sync_status or 'Never synced' }}</p>
+        {% if mirror_config.last_sync_time %}
+        <p><strong>Last sync:</strong> {{ mirror_config.last_sync_time }}</p>
+        {% endif %}
+    </div>
+</section>
+{% endif %}
+{% endblock %}

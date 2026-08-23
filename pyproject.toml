@@ -1,0 +1,107 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gitgateway"
+dynamic = ["version"]
+description = "A serverless Git hosting platform backed by AWS S3, API Gateway, Lambda, and DynamoDB."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Topaz Bott"},
+]
+keywords = ["git", "serverless", "aws", "lambda", "s3", "dynamodb"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Version Control :: Git",
+]
+dependencies = [
+    "boto3>=1.28.0",
+    "jinja2>=3.1.0",
+    "pygments>=2.16.0",
+    "pyjwt[crypto]>=2.8.0",
+    "cryptography>=41.0.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-playwright>=0.4.0",
+    "moto[all]>=5.0.0",
+    "pylint>=3.0.0",
+    "bandit>=1.7.0",
+    "cfn-lint>=1.0.0",
+    "yamllint>=1.32.0",
+    "hypothesis>=6.80.0",
+]
+
+[project.scripts]
+gitgateway = "gitgateway.cli:main"
+git-remote-gitgateway = "gitgateway.remote_helper:main"
+
+[project.urls]
+Homepage = "https://github.com/tmb28054/gitgateway"
+Documentation = "https://github.com/tmb28054/gitgateway/tree/main/docs"
+Repository = "https://github.com/tmb28054/gitgateway"
+
+[tool.hatch.version]
+path = "CHANGELOG.md"
+pattern = "## \\[(?P<version>\\d+\\.\\d+\\.\\d+)\\]"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gitgateway"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+
+[tool.setuptools.package-data]
+gitgateway = ["template.yaml", "sast_buildspec.yaml", "web/templates/**/*", "web/static/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "smoke: Smoke tests for basic functionality",
+    "e2e: End-to-end integration tests against deployed instance",
+]
+
+[tool.coverage.run]
+source = ["gitgateway"]
+branch = true
+partial_branches = [
+    "pragma: no branch",
+]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "if TYPE_CHECKING:",
+]
+
+[tool.pylint.main]
+max-line-length = 88
+disable = [
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-instance-attributes",
+    "duplicate-code",
+]
+
+[tool.pylint.format]
+max-line-length = 88
+
+[tool.bandit]
+exclude_dirs = ["tests"]

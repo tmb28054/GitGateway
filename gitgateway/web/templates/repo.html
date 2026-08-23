@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}{{ repo.group }}/{{ repo.name }} - GitGateway{% endblock %}
+{% block content %}
+<h1>{{ repo.group }}/{{ repo.name }}</h1>
+{% if repo.description %}
+<p style="color: #586069; margin: 0.5rem 0;">{{ repo.description }}</p>
+{% endif %}
+
+<div style="margin: 1rem 0; display: flex; gap: 1rem; align-items: center;">
+    <select id="branch-select" style="padding: 0.4rem 0.8rem; border-radius: 6px; border: 1px solid #d1d5da;">
+        {% for branch in branches %}
+        <option value="{{ branch }}" {% if branch == current_branch %}selected{% endif %}>{{ branch }}</option>
+        {% endfor %}
+    </select>
+    <a href="/{{ repo.group }}/{{ repo.name }}/pulls" class="btn btn-secondary">Pull Requests</a>
+</div>
+
+<table style="width: 100%; border-collapse: collapse; margin-top: 1rem;">
+    <thead>
+        <tr style="border-bottom: 1px solid #e1e4e8;">
+            <th style="text-align: left; padding: 0.5rem;">Name</th>
+            <th style="text-align: left; padding: 0.5rem;">Type</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for file in files %}
+        <tr style="border-bottom: 1px solid #f0f0f0;">
+            <td style="padding: 0.5rem;">
+                <a href="/{{ repo.group }}/{{ repo.name }}/blob/{{ current_branch }}/{{ file.path }}" style="color: #0366d6; text-decoration: none;">
+                    {{ file.name }}
+                </a>
+            </td>
+            <td style="padding: 0.5rem; color: #586069;">{{ file.type }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

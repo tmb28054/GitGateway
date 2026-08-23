@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Pull Requests - {{ repo.group }}/{{ repo.name }} - GitGateway{% endblock %}
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center;">
+    <h1>Pull Requests</h1>
+    <a href="/{{ repo.group }}/{{ repo.name }}/pulls/new" class="btn btn-primary">New Pull Request</a>
+</div>
+
+<div style="margin: 1rem 0; display: flex; gap: 0.5rem;">
+    <a href="?status=open" class="btn {% if current_status == 'open' %}btn-primary{% else %}btn-secondary{% endif %}">Open ({{ counts.open }})</a>
+    <a href="?status=merged" class="btn {% if current_status == 'merged' %}btn-primary{% else %}btn-secondary{% endif %}">Merged ({{ counts.merged }})</a>
+    <a href="?status=closed" class="btn {% if current_status == 'closed' %}btn-primary{% else %}btn-secondary{% endif %}">Closed ({{ counts.closed }})</a>
+</div>
+
+<ul style="list-style: none; padding: 0;">
+    {% for pr in pull_requests %}
+    <li style="padding: 1rem 0; border-bottom: 1px solid #e1e4e8;">
+        <div style="display: flex; align-items: center; gap: 0.5rem;">
+            <span style="color: {% if pr.status == 'open' %}#2ea44f{% elif pr.status == 'merged' %}#6f42c1{% else %}#cb2431{% endif %}; font-weight: bold;">
+                {% if pr.status == 'open' %}Open{% elif pr.status == 'merged' %}Merged{% else %}Closed{% endif %}
+            </span>
+            <a href="/{{ repo.group }}/{{ repo.name }}/pulls/{{ pr.number }}" style="font-weight: 600; font-size: 1.1rem; color: #24292e; text-decoration: none;">
+                {{ pr.title }}
+            </a>
+            <span style="color: #586069; font-size: 0.85rem;">#{{ pr.number }}</span>
+        </div>
+        <div style="color: #586069; font-size: 0.85rem; margin-top: 0.25rem;">
+            {{ pr.author }} wants to merge {{ pr.source_branch }} into {{ pr.target_branch }}
+        </div>
+    </li>
+    {% endfor %}
+    {% if not pull_requests %}
+    <li style="padding: 2rem 0; color: #586069; text-align: center;">
+        No pull requests found.
+    </li>
+    {% endif %}
+</ul>
+{% endblock %}

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Error {{ status_code }} - GitGateway{% endblock %}
+{% block content %}
+<div style="text-align: center; margin: 4rem 0;">
+    <h1 style="font-size: 3rem; color: #586069;">{{ status_code }}</h1>
+    <p style="font-size: 1.2rem; margin-top: 1rem;">{{ message }}</p>
+    <a href="/" class="btn btn-primary" style="margin-top: 2rem;">Go Home</a>
+</div>
+{% endblock %}

@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - GitGateway{% endblock %}
+{% block content %}
+<h1>Repositories</h1>
+{% for group in groups %}
+<section style="margin: 2rem 0;">
+    <h2 style="border-bottom: 1px solid #e1e4e8; padding-bottom: 0.5rem;">{{ group.name }}</h2>
+    <ul style="list-style: none; padding: 0;">
+        {% for repo in group.repos %}
+        <li style="padding: 0.75rem 0; border-bottom: 1px solid #f0f0f0;">
+            <a href="/{{ group.name }}/{{ repo.name }}" style="font-weight: 600; color: #0366d6; text-decoration: none;">
+                {{ group.name }}/{{ repo.name }}
+            </a>
+            {% if repo.description %}
+            <p style="color: #586069; font-size: 0.875rem; margin-top: 0.25rem;">{{ repo.description }}</p>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</section>
+{% endfor %}
+{% if not groups %}
+<p style="color: #586069; margin-top: 2rem;">No repositories found. Create one to get started.</p>
+{% endif %}
+{% endblock %}
