@@ -903,14 +903,22 @@ def _get_page_content(path: str, user_info: dict) -> str:
         parts = path[8:].split("/")
         return _render_repo_page(parts[0], parts[1], username, "")
 
-    # /groups/<group>/<repo>/settings — repo settings
-    if path.startswith("/groups/") and path.endswith("/settings"):
+    # /groups/<group>/<repo>/settings — repo settings (not inside /tree/)
+    if (
+        path.startswith("/groups/")
+        and path.endswith("/settings")
+        and "/tree/" not in path
+    ):
         parts = path[8:].rsplit("/settings", 1)[0].split("/", 1)
         if len(parts) == 2:
             return _render_repo_settings_page(parts[0], parts[1], username)
 
-    # /groups/<group>/<repo>/commits — commit history
-    if path.startswith("/groups/") and path.endswith("/commits"):
+    # /groups/<group>/<repo>/commits — commit history (not inside /tree/)
+    if (
+        path.startswith("/groups/")
+        and path.endswith("/commits")
+        and "/tree/" not in path
+    ):
         parts = path[8:].rsplit("/commits", 1)[0].split("/", 1)
         if len(parts) == 2:
             return _render_commits_page(parts[0], parts[1], username)
