@@ -1,3 +1,5 @@
+2026-08-21.tar.gz
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -69,3 +71,4 @@ Thumbs.db
 
 # Project specific
 trash/
+2026-08-21.tar.gz

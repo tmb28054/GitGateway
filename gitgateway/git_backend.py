@@ -690,7 +690,7 @@ def _index_commit_history(
     repo_name: str,
     branch: str,
     head_sha: bytes,
-    max_commits: int = 100,
+    max_commits: int = 200,
 ) -> None:
     """Walk commit history and store in DynamoDB.
 
