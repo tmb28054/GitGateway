@@ -681,6 +681,129 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
             headers=headers,
         )
 
+    # POST /api/<group>/<repo>/pulls/<number>/comments — add comment
+    comment_match = re.match(
+        r"^/api/([^/]+)/([^/]+)/pulls/(\d+)/comments$", path,
+    )
+    if comment_match and method == "POST":
+        from gitgateway.reviews import (  # pylint: disable=import-outside-toplevel
+            add_comment, Comment,
+        )
+        try:
+            body = json.loads(request.body.decode()) if request.body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return Response(
+                status_code=400,
+                body=json.dumps({"error": "Invalid JSON"}),
+                headers=headers,
+            )
+        c = add_comment(Comment(
+            pr_number=int(comment_match.group(3)),
+            author=body.get("author", ""),
+            body=body.get("body", ""),
+            group=comment_match.group(1),
+            repo=comment_match.group(2),
+        ))
+        return Response(
+            status_code=201,
+            body=json.dumps(c.to_dict()),
+            headers=headers,
+        )
+
+    # GET /api/<group>/<repo>/pulls/<number>/comments — list comments
+    if comment_match and method == "GET":
+        from gitgateway.reviews import list_comments  # pylint: disable=import-outside-toplevel
+        comments = list_comments(
+            comment_match.group(1),
+            comment_match.group(2),
+            int(comment_match.group(3)),
+        )
+        return Response(
+            status_code=200,
+            body=json.dumps([c.to_dict() for c in comments]),
+            headers=headers,
+        )
+
+    # POST /api/<group>/<repo>/pulls/<number>/reviews — submit review
+    review_match = re.match(
+        r"^/api/([^/]+)/([^/]+)/pulls/(\d+)/reviews$", path,
+    )
+    if review_match and method == "POST":
+        from gitgateway.reviews import (  # pylint: disable=import-outside-toplevel
+            create_review, Review, ReviewStatus,
+        )
+        try:
+            body = json.loads(request.body.decode()) if request.body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return Response(
+                status_code=400,
+                body=json.dumps({"error": "Invalid JSON"}),
+                headers=headers,
+            )
+        status_str = body.get("status", "commented")
+        try:
+            review_status = ReviewStatus(status_str)
+        except ValueError:
+            return Response(
+                status_code=400,
+                body=json.dumps({"error": f"Invalid status: {status_str}"}),
+                headers=headers,
+            )
+        r = create_review(Review(
+            pr_number=int(review_match.group(3)),
+            author=body.get("author", ""),
+            status=review_status,
+            body=body.get("body", ""),
+            group=review_match.group(1),
+            repo=review_match.group(2),
+        ))
+        return Response(
+            status_code=201,
+            body=json.dumps(r.to_dict()),
+            headers=headers,
+        )
+
+    # POST /api/<group>/<repo>/pulls/<number>/merge — merge PR
+    merge_match = re.match(
+        r"^/api/([^/]+)/([^/]+)/pulls/(\d+)/merge$", path,
+    )
+    if merge_match and method == "POST":
+        from gitgateway.pullrequest import (  # pylint: disable=import-outside-toplevel
+            merge_pr, MergeStrategy, PrNotFoundError, InvalidTransitionError,
+        )
+        try:
+            body = json.loads(request.body.decode()) if request.body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = {}
+        strategy_str = body.get("strategy", "merge")
+        try:
+            strategy = MergeStrategy(strategy_str)
+        except ValueError:
+            strategy = MergeStrategy.MERGE
+        try:
+            merged = merge_pr(
+                merge_match.group(1), merge_match.group(2),
+                int(merge_match.group(3)),
+                strategy=strategy,
+            )
+            return Response(
+                status_code=200,
+                body=json.dumps(merged.to_dict()),
+                headers=headers,
+            )
+        except PrNotFoundError:
+            return Response(
+                status_code=404,
+                body=json.dumps({"error": "PR not found"}),
+                headers=headers,
+            )
+        except InvalidTransitionError as exc:
+            return Response(
+                status_code=409,
+                body=json.dumps({"error": str(exc)}),
+                headers=headers,
+            )
+
     # POST /api/access — grant access
     if path == "/api/access" and method == "POST":
         try:
@@ -1009,6 +1132,25 @@ def _get_page_content(path: str, user_info: dict) -> str:
         if len(parts) == 2:
             return _render_pulls_page(parts[0], parts[1], username)
 
+    # /groups/<group>/<repo>/pulls/<number> — PR detail page
+    if (
+        path.startswith("/groups/")
+        and "/pulls/" in path
+        and "/tree/" not in path
+    ):
+        after = path[8:]
+        pr_parts = after.split("/pulls/", 1)
+        if len(pr_parts) == 2:
+            gr_parts = pr_parts[0].split("/", 1)
+            if len(gr_parts) == 2:
+                try:
+                    pr_num = int(pr_parts[1])
+                    return _render_pr_detail_page(
+                        gr_parts[0], gr_parts[1], username, pr_num,
+                    )
+                except ValueError:
+                    pass
+
     # /groups/<group>/<repo>/branches — branches page (not inside /tree/)
     if (
         path.startswith("/groups/")
@@ -1100,6 +1242,221 @@ def _render_user_groups_page(username: str) -> str:
     </table>"""
 
 
+def _render_pr_detail_page(
+    group: str, repo_name: str, username: str, pr_number: int,
+) -> str:
+    """Render the PR detail page with diff, comments, and review actions.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        username: Authenticated user.
+        pr_number: PR number.
+
+    Returns:
+        HTML content.
+    """
+    import time as _time  # pylint: disable=import-outside-toplevel
+    from gitgateway.db import check_permission  # pylint: disable=import-outside-toplevel
+    from gitgateway.pullrequest import (  # pylint: disable=import-outside-toplevel
+        get_pr, PrNotFoundError,
+    )
+    from gitgateway.reviews import (  # pylint: disable=import-outside-toplevel
+        list_comments, list_reviews,
+    )
+    from gitgateway.models import AccessLevel  # pylint: disable=import-outside-toplevel
+
+    if not check_permission(username, group, repo_name):
+        return "<h1>403 Forbidden</h1>"
+
+    try:
+        pr = get_pr(group, repo_name, pr_number)
+    except PrNotFoundError:
+        return f"<h1>404</h1><p>PR #{pr_number} not found.</p>"
+
+    is_admin = check_permission(
+        username, group, repo_name, required_level=AccessLevel.ADMIN,
+    )
+
+    # Get comments and reviews
+    comments = list_comments(group, repo_name, pr_number)
+    reviews = list_reviews(group, repo_name, pr_number)
+
+    # Status badge
+    status_color = {
+        "open": "#2ea44f", "merged": "#6f42c1", "closed": "#cb2431",
+    }.get(pr.status.value, "#586069")
+
+    # Build comments section
+    comments_html = ""
+    for c in comments:
+        comments_html += f"""
+        <div style="border:1px solid #e1e4e8;border-radius:6px;
+          margin-bottom:0.75rem;">
+          <div style="background:#f6f8fa;padding:0.5rem 1rem;
+            border-bottom:1px solid #e1e4e8;font-size:0.85rem;">
+            <strong>{c.author}</strong>
+            <span style="color:#586069;"> commented {c.created_at}</span>
+          </div>
+          <div style="padding:0.75rem 1rem;">{c.body}</div>
+        </div>"""
+
+    # Build reviews section
+    reviews_html = ""
+    for r in reviews:
+        review_color = {
+            "approved": "#2ea44f",
+            "changes_requested": "#cb2431",
+            "commented": "#586069",
+        }.get(r.status.value, "#586069")
+        review_label = {
+            "approved": "approved",
+            "changes_requested": "requested changes",
+            "commented": "commented",
+        }.get(r.status.value, r.status.value)
+        reviews_html += f"""
+        <div style="padding:0.5rem 0;display:flex;align-items:center;gap:0.5rem;">
+          <strong>{r.author}</strong>
+          <span style="color:{review_color};">{review_label}</span>
+          {'<span style="color:#586069;font-size:0.85rem;">— ' + r.body + '</span>' if r.body else ''}
+        </div>"""
+
+    # Review actions (only for open PRs)
+    review_actions = ""
+    if pr.status.value == "open":
+        review_actions = f"""
+    <div style="border:1px solid #e1e4e8;border-radius:6px;
+      padding:1rem;margin-top:1.5rem;">
+      <h3 style="margin-bottom:0.75rem;">Add Comment or Review</h3>
+      <textarea id="review-body" rows="4" placeholder="Leave a comment..."
+        style="width:100%;padding:0.5rem;border:1px solid #d1d5da;
+        border-radius:4px;margin-bottom:0.75rem;resize:vertical;"></textarea>
+      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+        <button onclick="submitComment()"
+          style="background:#fafbfc;border:1px solid #d1d5da;
+          padding:0.4rem 1rem;border-radius:4px;cursor:pointer;">
+          Comment</button>
+        <button onclick="submitReview('approved')"
+          style="background:#2ea44f;color:#fff;border:none;
+          padding:0.4rem 1rem;border-radius:4px;cursor:pointer;">
+          Approve</button>
+        <button onclick="submitReview('changes_requested')"
+          style="background:#cb2431;color:#fff;border:none;
+          padding:0.4rem 1rem;border-radius:4px;cursor:pointer;">
+          Request Changes</button>
+      </div>
+      <div id="review-message" style="margin-top:0.5rem;font-size:0.85rem;"></div>
+    </div>"""
+
+    # Merge button (admin only, open PRs)
+    merge_btn = ""
+    if pr.status.value == "open" and is_admin:
+        merge_btn = f"""
+    <div style="margin-top:1rem;">
+      <button onclick="mergePR()"
+        style="background:#2ea44f;color:#fff;border:none;
+        padding:0.5rem 1.5rem;border-radius:4px;cursor:pointer;
+        font-size:1rem;">Merge Pull Request</button>
+    </div>"""
+
+    # Settings gear
+    settings_link = ""
+    if is_admin:
+        settings_link = (
+            f'<a href="/groups/{group}/{repo_name}/settings" '
+            f'title="Settings" style="font-size:1.2rem;">⚙️</a>'
+        )
+
+    return f"""
+    <div style="display:flex;justify-content:space-between;
+      align-items:center;margin-bottom:1rem;">
+      <h1 style="margin:0;">
+        <a href="/groups/{group}" style="color:#586069;
+          font-weight:normal;">{group}</a> /
+        <a href="/groups/{group}/{repo_name}">{repo_name}</a>
+      </h1>
+      {settings_link}
+    </div>
+
+    <div style="display:flex;gap:1rem;border-bottom:1px solid #e1e4e8;
+      margin-bottom:1.5rem;">
+      <a href="/groups/{group}/{repo_name}"
+        style="padding:0.5rem 1rem;color:#586069;">Code</a>
+      <a href="/groups/{group}/{repo_name}/pulls"
+        style="padding:0.5rem 1rem;font-weight:600;
+        border-bottom:2px solid #f9826c;">Pull Requests</a>
+      <a href="/groups/{group}/{repo_name}/commits"
+        style="padding:0.5rem 1rem;color:#586069;">Commits</a>
+      <a href="/groups/{group}/{repo_name}/branches"
+        style="padding:0.5rem 1rem;color:#586069;">Branches</a>
+    </div>
+
+    <div style="margin-bottom:1.5rem;">
+      <h2 style="margin:0;">{pr.title}
+        <span style="color:#586069;font-weight:normal;"> #{pr.number}</span>
+      </h2>
+      <div style="margin-top:0.5rem;display:flex;align-items:center;gap:0.5rem;">
+        <span style="background:{status_color};color:#fff;
+          padding:0.2rem 0.6rem;border-radius:12px;font-size:0.8rem;">
+          {pr.status.value.capitalize()}</span>
+        <span style="color:#586069;">
+          <strong>{pr.author or 'unknown'}</strong> wants to merge
+          <code>{pr.source_branch}</code> into
+          <code>{pr.target_branch}</code>
+        </span>
+      </div>
+      {f'<p style="margin-top:0.75rem;">{pr.description}</p>' if pr.description else ''}
+    </div>
+
+    {'<div style="margin-bottom:1.5rem;"><h3>Reviews</h3>' + reviews_html + '</div>' if reviews_html else ''}
+
+    <div style="margin-bottom:1.5rem;">
+      <h3>Comments ({len(comments)})</h3>
+      {comments_html if comments_html else '<p style="color:#586069;">No comments yet.</p>'}
+    </div>
+
+    {review_actions}
+    {merge_btn}
+
+    <script>
+    async function submitComment() {{
+      const body = document.getElementById('review-body').value;
+      const msg = document.getElementById('review-message');
+      if (!body.trim()) {{ msg.innerHTML = '<span style="color:#cb2431;">Please write a comment.</span>'; return; }}
+      const resp = await fetch('/api/{group}/{repo_name}/pulls/{pr_number}/comments', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{body, author: '{username}'}})
+      }});
+      if (resp.ok) {{ location.reload(); }}
+      else {{ msg.innerHTML = '<span style="color:#cb2431;">Failed to post comment.</span>'; }}
+    }}
+
+    async function submitReview(status) {{
+      const body = document.getElementById('review-body').value;
+      const msg = document.getElementById('review-message');
+      const resp = await fetch('/api/{group}/{repo_name}/pulls/{pr_number}/reviews', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{status, body, author: '{username}'}})
+      }});
+      if (resp.ok) {{ location.reload(); }}
+      else {{ msg.innerHTML = '<span style="color:#cb2431;">Failed to submit review.</span>'; }}
+    }}
+
+    async function mergePR() {{
+      if (!confirm('Merge this pull request?')) return;
+      const resp = await fetch('/api/{group}/{repo_name}/pulls/{pr_number}/merge', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{strategy: 'merge'}})
+      }});
+      if (resp.ok) {{ location.reload(); }}
+      else {{ alert('Merge failed'); }}
+    }}
+    </script>"""
+
+
 def _render_pulls_page(
     group: str, repo_name: str, username: str,
 ) -> str:
@@ -1134,7 +1491,8 @@ def _render_pulls_page(
         color = {
             "open": "#2ea44f", "merged": "#6f42c1", "closed": "#cb2431",
         }.get(status, "#586069")
-        rows += f"""<tr style="border-bottom:1px solid #f0f0f0;">
+        rows += f"""<tr style="border-bottom:1px solid #f0f0f0;cursor:pointer;"
+          onclick="window.location='/groups/{group}/{repo_name}/pulls/{pr.number}'">
           <td style="padding:0.75rem;">
             <div>
               <span style="color:{color};font-weight:bold;
