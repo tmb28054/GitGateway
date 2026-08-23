@@ -1251,6 +1251,7 @@ def _render_user_groups_page(username: str) -> str:
 
 def _compute_pr_diff(
     group: str, repo_name: str, target_branch: str, source_branch: str,
+    lint_failed_files: set | None = None,
 ) -> str:
     """Compute the diff between target and source branches for a PR.
 
@@ -1259,6 +1260,7 @@ def _compute_pr_diff(
         repo_name: Repository name.
         target_branch: The target (base) branch.
         source_branch: The source (head) branch.
+        lint_failed_files: Set of file paths that failed linting.
 
     Returns:
         HTML string showing the diff.
@@ -1339,12 +1341,16 @@ def _compute_pr_diff(
                     colored.append(line)
             diff_content = "\n".join(colored)
 
+        lint_icon = ""
+        if lint_failed_files and entry["path"] in lint_failed_files:
+            lint_icon = '<span style="color:#cb2431;margin-right:0.5rem;" title="Lint failed">✗</span>'
+
         html += f"""
         <div style="border:1px solid #e1e4e8;border-radius:6px;margin-bottom:1rem;">
           <div style="background:#f6f8fa;padding:0.5rem 1rem;
             border-bottom:1px solid #e1e4e8;display:flex;
             justify-content:space-between;align-items:center;">
-            <strong>{entry["path"]}</strong>
+            <span>{lint_icon}<strong>{entry["path"]}</strong></span>
             {status_badge}
           </div>
           <pre style="margin:0;padding:1rem;font-size:0.8rem;
@@ -1393,6 +1399,35 @@ def _render_pr_detail_page(
     # Get comments and reviews
     comments = list_comments(group, repo_name, pr_number)
     reviews = list_reviews(group, repo_name, pr_number)
+
+    # Get status checks
+    from gitgateway.status_checks import list_statuses  # pylint: disable=import-outside-toplevel
+    statuses = list_statuses(group, repo_name, pr_number)
+
+    # Build status checks display
+    checks_html = ""
+    if statuses:
+        checks_html = '<div style="border:1px solid #e1e4e8;border-radius:6px;padding:1rem;margin-bottom:1.5rem;"><h3 style="margin-bottom:0.75rem;">Checks</h3>'
+        for s in statuses:
+            icon = "✓" if s.status.value == "success" else "✗"
+            color = "#2ea44f" if s.status.value == "success" else "#cb2431"
+            checks_html += (
+                f'<div style="padding:0.3rem 0;display:flex;align-items:center;gap:0.5rem;">'
+                f'<span style="color:{color};font-weight:bold;font-size:1.1rem;">{icon}</span>'
+                f'<span style="font-weight:600;">{s.name}</span>'
+                f'<span style="color:#586069;font-size:0.85rem;">— {s.description}</span>'
+                f'</div>'
+            )
+        checks_html += '</div>'
+
+    # Build a set of files with lint findings (for ✗ in diff)
+    lint_failed_files: set = set()
+    for c in comments:
+        if c.author == "gitgateway-lint" and "✗" in c.body:
+            # Parse file paths from the lint comment
+            import re as _re_lint  # pylint: disable=import-outside-toplevel
+            for match in _re_lint.finditer(r"`([^:]+):\d+`", c.body):
+                lint_failed_files.add(match.group(1))
 
     # Status badge
     status_color = {
@@ -1472,7 +1507,10 @@ def _render_pr_detail_page(
     </div>"""
 
     # Compute diff between target and source branches
-    diff_html = _compute_pr_diff(group, repo_name, pr.target_branch, pr.source_branch)
+    diff_html = _compute_pr_diff(
+        group, repo_name, pr.target_branch, pr.source_branch,
+        lint_failed_files,
+    )
 
     # Settings gear
     settings_link = ""
@@ -1522,6 +1560,8 @@ def _render_pr_detail_page(
       </div>
       {f'<p style="margin-top:0.75rem;">{pr.description}</p>' if pr.description else ''}
     </div>
+
+    {checks_html}
 
     {'<div style="margin-bottom:1.5rem;"><h3>Reviews</h3>' + reviews_html + '</div>' if reviews_html else ''}
 
@@ -3469,8 +3509,8 @@ def _run_pr_linting(
 ) -> None:
     """Run linters on a PR's source branch and post results.
 
-    Reads all files from the DynamoDB tree cache for the source branch,
-    runs all applicable linters, and posts a status check + comment.
+    Posts individual status checks per linter (✓/✗) and a comment
+    with findings details.
 
     Args:
         group: Group name.
@@ -3479,7 +3519,9 @@ def _run_pr_linting(
         source_branch: Branch to lint.
     """
     import boto3  # pylint: disable=import-outside-toplevel
-    from gitgateway.lint import run_all_linters  # pylint: disable=import-outside-toplevel
+    from gitgateway.lint import (  # pylint: disable=import-outside-toplevel
+        _run_pylint, _run_bandit, _run_yamllint, _run_json_check,
+    )
     from gitgateway.status_checks import (  # pylint: disable=import-outside-toplevel
         post_status, StatusCheck, CheckStatus,
     )
@@ -3499,8 +3541,6 @@ def _run_pr_linting(
     items = response.get("Items", [])
 
     if not items:
-        LOG.info("No files in tree cache for %s/%s#%s, skipping lint",
-                 group, repo_name, source_branch)
         return
 
     # Build files dict
@@ -3514,10 +3554,9 @@ def _run_pr_linting(
     if not files:
         return
 
-    # Limit total content size to avoid timeout (max 200KB of files)
+    # Limit total content size to avoid timeout
     total_size = sum(len(c) for c in files.values())
     if total_size > 200_000:
-        # Only lint smaller files to stay within Lambda timeout
         small_files = {
             p: c for p, c in files.items() if len(c) < 20_000
         }
@@ -3526,29 +3565,113 @@ def _run_pr_linting(
     if not files:
         return
 
-    # Run linters
-    result = run_all_linters(files)
+    # Categorize files
+    python_files = {
+        p: c for p, c in files.items()
+        if p.endswith(".py") and c.strip()
+    }
+    yaml_files = {
+        p: c for p, c in files.items()
+        if p.endswith((".yaml", ".yml")) and c.strip()
+    }
+    json_files = {
+        p: c for p, c in files.items()
+        if p.endswith(".json") and c.strip()
+    }
 
-    # Post status check
-    check_status = CheckStatus.SUCCESS if result.passed else CheckStatus.FAILURE
+    # Run each linter and post individual status checks
+    all_findings = []
+    linter_results = {}  # name -> (passed, count)
+
+    if python_files:
+        pylint_findings = _run_pylint(python_files)
+        all_findings.extend(pylint_findings)
+        pylint_passed = not any(
+            f.severity == "error" for f in pylint_findings
+        )
+        linter_results["pylint"] = (pylint_passed, len(pylint_findings))
+        post_status(StatusCheck(
+            name="lint/pylint",
+            status=CheckStatus.SUCCESS if pylint_passed else CheckStatus.FAILURE,
+            description=f"{len(pylint_findings)} finding(s)",
+            pr_number=pr_number, group=group, repo=repo_name,
+        ))
+
+        bandit_findings = _run_bandit(python_files)
+        all_findings.extend(bandit_findings)
+        bandit_passed = not any(
+            f.severity == "error" for f in bandit_findings
+        )
+        linter_results["bandit"] = (bandit_passed, len(bandit_findings))
+        post_status(StatusCheck(
+            name="lint/bandit",
+            status=CheckStatus.SUCCESS if bandit_passed else CheckStatus.FAILURE,
+            description=f"{len(bandit_findings)} finding(s)",
+            pr_number=pr_number, group=group, repo=repo_name,
+        ))
+
+    if yaml_files:
+        yaml_findings = _run_yamllint(yaml_files)
+        all_findings.extend(yaml_findings)
+        yaml_passed = not any(
+            f.severity == "error" for f in yaml_findings
+        )
+        linter_results["yamllint"] = (yaml_passed, len(yaml_findings))
+        post_status(StatusCheck(
+            name="lint/yamllint",
+            status=CheckStatus.SUCCESS if yaml_passed else CheckStatus.FAILURE,
+            description=f"{len(yaml_findings)} finding(s)",
+            pr_number=pr_number, group=group, repo=repo_name,
+        ))
+
+    if json_files:
+        json_findings = _run_json_check(json_files)
+        all_findings.extend(json_findings)
+        json_passed = not any(
+            f.severity == "error" for f in json_findings
+        )
+        linter_results["json"] = (json_passed, len(json_findings))
+        post_status(StatusCheck(
+            name="lint/json",
+            status=CheckStatus.SUCCESS if json_passed else CheckStatus.FAILURE,
+            description=f"{len(json_findings)} finding(s)",
+            pr_number=pr_number, group=group, repo=repo_name,
+        ))
+
+    # Post overall status
+    overall_passed = all(v[0] for v in linter_results.values())
     post_status(StatusCheck(
         name="lint",
-        status=check_status,
-        description=result.summary,
-        pr_number=pr_number,
-        group=group,
-        repo=repo_name,
+        status=CheckStatus.SUCCESS if overall_passed else CheckStatus.FAILURE,
+        description=f"{len(all_findings)} total finding(s)",
+        pr_number=pr_number, group=group, repo=repo_name,
     ))
 
-    # Post findings as a comment if there are any
-    if result.findings:
-        findings_text = f"**Lint Results: {'PASSED' if result.passed else 'FAILED'}**\n\n"
-        findings_text += f"{result.summary}\n\n"
-        for f in result.findings[:50]:  # Limit to 50 findings
-            findings_text += f"- `{f.file_path}:{f.line}` [{f.tool}] {f.message}\n"
-        if len(result.findings) > 50:
-            findings_text += f"\n... and {len(result.findings) - 50} more findings"
+    # Post findings as comment
+    if all_findings:
+        findings_text = "**Lint Results**\n\n"
+        for name, (passed, count) in linter_results.items():
+            icon = "✓" if passed else "✗"
+            findings_text += f"- {icon} **{name}**: {count} finding(s)\n"
+        findings_text += f"\n**{'PASSED' if overall_passed else 'FAILED'}** — {len(all_findings)} total finding(s)\n\n"
+        for f in all_findings[:50]:
+            findings_text += f"- ✗ `{f.file_path}:{f.line}` [{f.tool}] {f.message}\n"
+        if len(all_findings) > 50:
+            findings_text += f"\n... and {len(all_findings) - 50} more"
 
+        add_comment(Comment(
+            pr_number=pr_number,
+            author="gitgateway-lint",
+            body=findings_text,
+            group=group,
+            repo=repo_name,
+        ))
+    else:
+        # All passed, post a success comment
+        findings_text = "**Lint Results**\n\n"
+        for name, (passed, count) in linter_results.items():
+            findings_text += f"- ✓ **{name}**: passed\n"
+        findings_text += "\n**PASSED** — All checks passed"
         add_comment(Comment(
             pr_number=pr_number,
             author="gitgateway-lint",
@@ -3559,8 +3682,8 @@ def _run_pr_linting(
 
     LOG.info(
         "Lint for PR #%d: %s (%d findings)",
-        pr_number, "PASSED" if result.passed else "FAILED",
-        len(result.findings),
+        pr_number, "PASSED" if overall_passed else "FAILED",
+        len(all_findings),
     )
 
 
