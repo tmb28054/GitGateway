@@ -1242,6 +1242,111 @@ def _render_user_groups_page(username: str) -> str:
     </table>"""
 
 
+def _compute_pr_diff(
+    group: str, repo_name: str, target_branch: str, source_branch: str,
+) -> str:
+    """Compute the diff between target and source branches for a PR.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        target_branch: The target (base) branch.
+        source_branch: The source (head) branch.
+
+    Returns:
+        HTML string showing the diff.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+    from pathlib import Path as _Path  # pylint: disable=import-outside-toplevel
+    import tempfile as _tempfile  # pylint: disable=import-outside-toplevel
+    from dulwich.repo import Repo as _Repo  # pylint: disable=import-outside-toplevel
+    from gitgateway.storage import (  # pylint: disable=import-outside-toplevel
+        sync_repo_to_local, repo_exists,
+    )
+
+    if not repo_exists(group, repo_name):
+        return '<p style="color:#586069;">Repository not found.</p>'
+
+    local_base = _Path(_tempfile.gettempdir()) / "gitgateway"
+    local_base.mkdir(parents=True, exist_ok=True)
+    local_path = local_base / group / f"{repo_name}.git"
+
+    try:
+        sync_repo_to_local(group, repo_name, local_base=local_base)
+        repo = _Repo(str(local_path))
+    except Exception:  # pylint: disable=broad-except
+        return '<p style="color:#586069;">Could not load repository.</p>'
+
+    # Resolve branch SHAs
+    refs = repo.get_refs()
+    target_ref = f"refs/heads/{target_branch}".encode()
+    source_ref = f"refs/heads/{source_branch}".encode()
+
+    target_sha = refs.get(target_ref)
+    source_sha = refs.get(source_ref)
+
+    if not source_sha:
+        return f'<p style="color:#586069;">Branch {source_branch} not found.</p>'
+
+    # Get trees
+    target_tree = None
+    if target_sha:
+        try:
+            target_commit = repo.object_store[target_sha]
+            target_tree = target_commit.tree
+        except (KeyError, Exception):  # pylint: disable=broad-except
+            pass
+
+    try:
+        source_commit = repo.object_store[source_sha]
+        source_tree = source_commit.tree
+    except (KeyError, Exception):  # pylint: disable=broad-except
+        return '<p style="color:#586069;">Could not read source branch.</p>'
+
+    # Compute diff
+    diff_entries = _compute_tree_diff(repo.object_store, target_tree, source_tree)
+
+    if not diff_entries:
+        return '<p style="color:#586069;">No differences between branches.</p>'
+
+    # Render diff
+    html = ""
+    for entry in diff_entries:
+        status_badge = {
+            "added": '<span style="background:#2ea44f;color:#fff;padding:0.1rem 0.4rem;border-radius:3px;font-size:0.75rem;">Added</span>',
+            "deleted": '<span style="background:#cb2431;color:#fff;padding:0.1rem 0.4rem;border-radius:3px;font-size:0.75rem;">Deleted</span>',
+            "modified": '<span style="background:#dbab09;color:#fff;padding:0.1rem 0.4rem;border-radius:3px;font-size:0.75rem;">Modified</span>',
+        }.get(entry["status"], "")
+
+        diff_content = ""
+        if entry.get("diff"):
+            escaped = entry["diff"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            lines = escaped.split("\n")
+            colored = []
+            for line in lines:
+                if line.startswith("+"):
+                    colored.append(f'<span style="background:#e6ffed;">{line}</span>')
+                elif line.startswith("-"):
+                    colored.append(f'<span style="background:#ffeef0;">{line}</span>')
+                else:
+                    colored.append(line)
+            diff_content = "\n".join(colored)
+
+        html += f"""
+        <div style="border:1px solid #e1e4e8;border-radius:6px;margin-bottom:1rem;">
+          <div style="background:#f6f8fa;padding:0.5rem 1rem;
+            border-bottom:1px solid #e1e4e8;display:flex;
+            justify-content:space-between;align-items:center;">
+            <strong>{entry["path"]}</strong>
+            {status_badge}
+          </div>
+          <pre style="margin:0;padding:1rem;font-size:0.8rem;
+            overflow-x:auto;line-height:1.5;">{diff_content}</pre>
+        </div>"""
+
+    return html
+
+
 def _render_pr_detail_page(
     group: str, repo_name: str, username: str, pr_number: int,
 ) -> str:
@@ -1359,6 +1464,9 @@ def _render_pr_detail_page(
         font-size:1rem;">Merge Pull Request</button>
     </div>"""
 
+    # Compute diff between target and source branches
+    diff_html = _compute_pr_diff(group, repo_name, pr.target_branch, pr.source_branch)
+
     # Settings gear
     settings_link = ""
     if is_admin:
@@ -1417,6 +1525,11 @@ def _render_pr_detail_page(
 
     {review_actions}
     {merge_btn}
+
+    <div style="margin-top:2rem;">
+      <h3 style="margin-bottom:1rem;">Files Changed</h3>
+      {diff_html}
+    </div>
 
     <script>
     async function submitComment() {{
