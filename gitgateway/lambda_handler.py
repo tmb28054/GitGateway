@@ -825,6 +825,10 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
         font-size:1.2rem;">GitGateway</a>
       <div style="display:flex;align-items:center;gap:1rem;">
         {admin_links}
+        <button onclick="toggleDarkMode()" id="dark-toggle"
+          style="background:none;border:1px solid #555;border-radius:4px;
+          padding:0.2rem 0.5rem;cursor:pointer;font-size:0.9rem;"
+          title="Toggle dark mode">🌙</button>
         <span style="color:#ccc;">{username}</span>
         <a href="/logout" style="color:#f97583;text-decoration:none;">
           Logout</a>
@@ -843,12 +847,27 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI',
-      Roboto, sans-serif; line-height: 1.6; color: #24292e; }}
+      Roboto, sans-serif; line-height: 1.6; color: #24292e;
+      background: #fff; transition: background 0.3s, color 0.3s; }}
     main {{ max-width: 1000px; margin: 2rem auto; padding: 0 1.5rem; }}
     h1 {{ margin-bottom: 1rem; }}
     a {{ color: #0366d6; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
     .empty {{ color: #586069; margin-top: 2rem; }}
+
+    body.dark {{ background: #0d1117; color: #c9d1d9; }}
+    body.dark a {{ color: #58a6ff; }}
+    body.dark nav {{ background: #161b22 !important; }}
+    body.dark table {{ border-color: #30363d !important; }}
+    body.dark tr {{ border-color: #21262d !important; }}
+    body.dark td, body.dark th {{ border-color: #30363d !important; }}
+    body.dark pre {{ background: #161b22 !important; }}
+    body.dark code {{ background: #161b22 !important; color: #c9d1d9; }}
+    body.dark input, body.dark select {{ background: #0d1117;
+      color: #c9d1d9; border-color: #30363d !important; }}
+    body.dark div[style*="background:#f6f8fa"],
+    body.dark div[style*="background: #f6f8fa"] {{
+      background: #161b22 !important; }}
   </style>
 </head>
 <body>
@@ -856,6 +875,19 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
   <main>
     {page_content}
   </main>
+  <script>
+  function toggleDarkMode() {{
+    document.body.classList.toggle('dark');
+    const isDark = document.body.classList.contains('dark');
+    localStorage.setItem('gitgateway-dark', isDark ? '1' : '0');
+    document.getElementById('dark-toggle').textContent = isDark ? '☀️' : '🌙';
+  }}
+  // Restore preference
+  if (localStorage.getItem('gitgateway-dark') === '1') {{
+    document.body.classList.add('dark');
+    document.getElementById('dark-toggle').textContent = '☀️';
+  }}
+  </script>
 </body>
 </html>"""
 
