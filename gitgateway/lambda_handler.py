@@ -1452,10 +1452,35 @@ def _render_repo_page(  # pylint: disable=too-many-locals
             font-size:0.85rem;text-align:right;">{commit_author}</td>
         </tr>"""
 
+    empty_guide = ""
     if not file_rows:
-        file_rows = """<tr><td colspan="3" style="padding:2rem;
-          color:#586069;text-align:center;">
-          This repository is empty.</td></tr>"""
+        file_rows = ""
+        empty_guide = f"""
+    <div style="border:1px solid #e1e4e8;border-radius:6px;padding:2rem;
+      margin-top:1rem;">
+      <h2 style="margin-bottom:1rem;">Quick setup</h2>
+      <div style="background:#f6f8fa;padding:0.75rem 1rem;border-radius:4px;
+        margin-bottom:1.5rem;font-family:monospace;font-size:0.85rem;">
+        {clone_url}
+      </div>
+
+      <h3 style="margin-bottom:0.75rem;">…or create a new repository on the command line</h3>
+      <pre style="background:#f6f8fa;padding:1rem;border-radius:4px;
+        font-size:0.85rem;overflow-x:auto;line-height:1.8;">echo "# {repo_name}" &gt;&gt; README.md
+git init
+git add README.md
+git commit -m "Initial commit"
+git branch -M main
+git remote add origin {clone_url}
+git push -u origin main</pre>
+
+      <h3 style="margin-top:1.5rem;margin-bottom:0.75rem;">
+        …or push an existing repository from the command line</h3>
+      <pre style="background:#f6f8fa;padding:1rem;border-radius:4px;
+        font-size:0.85rem;overflow-x:auto;line-height:1.8;">git remote add origin {clone_url}
+git branch -M main
+git push -u origin main</pre>
+    </div>"""
 
     # Check for README in current dir
     readme_html = ""
@@ -1550,13 +1575,9 @@ def _render_repo_page(  # pylint: disable=too-many-locals
       </div>
     </div>
 
-    <table style="width:100%;border-collapse:collapse;
-      border:1px solid #e1e4e8;border-radius:6px;">
-      <tbody>
-        {file_rows}
-      </tbody>
-    </table>
+    {'<table style="width:100%;border-collapse:collapse;border:1px solid #e1e4e8;border-radius:6px;"><tbody>' + file_rows + '</tbody></table>' if file_rows else ""}
 
+    {empty_guide}
     {readme_html}
 
     <script>
