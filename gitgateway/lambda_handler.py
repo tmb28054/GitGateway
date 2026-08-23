@@ -736,7 +736,9 @@ def _get_page_content(path: str, user_info: dict) -> str:
                 branch_and_path = repo_parts[1]
                 branch = branch_and_path.split("/")[0] if "/" in branch_and_path else branch_and_path
                 file_path = branch_and_path[len(branch) + 1:] if "/" in branch_and_path else ""
-                return _render_repo_page(gr_parts[0], gr_parts[1], username, branch, file_path)
+                return _render_repo_tree_or_file(
+                    gr_parts[0], gr_parts[1], username, branch, file_path,
+                )
 
     if path.startswith("/admin"):
         if not user_info.get("is_admin"):
@@ -801,6 +803,199 @@ def _render_user_groups_page(username: str) -> str:
         {rows}
       </tbody>
     </table>"""
+
+
+def _render_repo_tree_or_file(
+    group: str,
+    repo_name: str,
+    username: str,
+    branch: str,
+    file_path: str,
+) -> str:
+    """Route to either file viewer or directory tree.
+
+    Checks if the path is a file in the DynamoDB cache. If so,
+    renders the file viewer with syntax highlighting. Otherwise
+    renders the directory tree.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        username: Authenticated user.
+        branch: Branch name.
+        file_path: Path within the repo.
+
+    Returns:
+        HTML content.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+
+    if not file_path:
+        return _render_repo_page(group, repo_name, username, branch, "")
+
+    # Check if this path is a file in the cache
+    table = boto3.resource("dynamodb").Table("gitgateway-repos")
+    response = table.get_item(Key={
+        "PK": f"TREE#{group}/{repo_name}#{branch}",
+        "SK": f"FILE#{file_path}",
+    })
+    item = response.get("Item")
+
+    if item and item.get("type") == "file":
+        return _render_file_viewer(
+            group, repo_name, username, branch, file_path, item,
+        )
+
+    # Not a file — render as directory
+    return _render_repo_page(group, repo_name, username, branch, file_path)
+
+
+def _render_file_viewer(  # pylint: disable=too-many-positional-arguments
+    group: str,
+    repo_name: str,
+    username: str,
+    branch: str,
+    file_path: str,
+    file_item: dict,
+) -> str:
+    """Render a file with syntax highlighting.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        username: Authenticated user.
+        branch: Branch name.
+        file_path: File path within the repo.
+        file_item: DynamoDB item with file content.
+
+    Returns:
+        HTML content with syntax-highlighted code.
+    """
+    from gitgateway.db import check_permission  # pylint: disable=import-outside-toplevel
+    from gitgateway.models import AccessLevel  # pylint: disable=import-outside-toplevel
+
+    if not check_permission(username, group, repo_name):
+        return "<h1>403 Forbidden</h1>"
+
+    is_admin = check_permission(
+        username, group, repo_name, required_level=AccessLevel.ADMIN,
+    )
+
+    content = file_item.get("content", "")
+    filename = file_path.split("/")[-1]
+    line_count = len(content.split("\n")) if content else 0
+
+    # Syntax highlight using Pygments
+    highlighted = _highlight_code(content, filename)
+
+    # Build breadcrumb
+    parts = file_path.split("/")
+    tree_base = f"/groups/{group}/{repo_name}/tree/{branch}"
+    crumbs = [f'<a href="/groups/{group}/{repo_name}">{repo_name}</a>']
+    built = ""
+    for i, part in enumerate(parts):
+        built = f"{built}/{part}" if built else part
+        if i < len(parts) - 1:
+            crumbs.append(f'<a href="{tree_base}/{built}">{part}</a>')
+        else:
+            crumbs.append(f"<strong>{part}</strong>")
+    breadcrumb = " / ".join(crumbs)
+
+    # Settings gear
+    settings_link = ""
+    if is_admin:
+        settings_link = (
+            f'<a href="/groups/{group}/{repo_name}/settings" '
+            f'title="Settings" style="font-size:1.2rem;">⚙️</a>'
+        )
+
+    return f"""
+    <div style="display:flex;justify-content:space-between;
+      align-items:center;margin-bottom:1rem;">
+      <h1 style="margin:0;font-size:1.2rem;">
+        <a href="/groups/{group}" style="color:#586069;
+          font-weight:normal;">{group}</a> /
+        <a href="/groups/{group}/{repo_name}">{repo_name}</a>
+      </h1>
+      {settings_link}
+    </div>
+
+    <div style="display:flex;gap:1rem;border-bottom:1px solid #e1e4e8;
+      margin-bottom:1rem;">
+      <a href="/groups/{group}/{repo_name}"
+        style="padding:0.5rem 1rem;font-weight:600;
+        border-bottom:2px solid #f9826c;">Code</a>
+      <a href="/groups/{group}/{repo_name}/pulls"
+        style="padding:0.5rem 1rem;color:#586069;">Pull Requests</a>
+    </div>
+
+    <div style="margin-bottom:1rem;color:#586069;font-size:0.9rem;">
+      {breadcrumb}
+    </div>
+
+    <div style="border:1px solid #e1e4e8;border-radius:6px;overflow:hidden;">
+      <div style="background:#f6f8fa;padding:0.5rem 1rem;
+        border-bottom:1px solid #e1e4e8;display:flex;
+        justify-content:space-between;align-items:center;">
+        <span style="font-size:0.85rem;color:#586069;">
+          {filename} &middot; {line_count} lines</span>
+        <button onclick="navigator.clipboard.writeText(
+          document.getElementById('file-content').innerText)"
+          style="padding:0.3rem 0.6rem;border:1px solid #d1d5da;
+          border-radius:4px;cursor:pointer;background:#fafbfc;
+          font-size:0.8rem;">Copy</button>
+      </div>
+      <div id="file-content" style="overflow-x:auto;">
+        {highlighted}
+      </div>
+    </div>"""
+
+
+def _highlight_code(content: str, filename: str) -> str:
+    """Syntax-highlight code using Pygments.
+
+    Args:
+        content: File content.
+        filename: Filename (used to detect language).
+
+    Returns:
+        HTML string with highlighted code.
+    """
+    try:
+        from pygments import highlight  # pylint: disable=import-outside-toplevel
+        from pygments.lexers import (  # pylint: disable=import-outside-toplevel
+            get_lexer_for_filename,
+            TextLexer,
+        )
+        from pygments.formatters import HtmlFormatter  # pylint: disable=import-outside-toplevel
+
+        try:
+            lexer = get_lexer_for_filename(filename)
+        except Exception:  # pylint: disable=broad-except
+            lexer = TextLexer()
+
+        formatter = HtmlFormatter(
+            linenos=True,
+            cssclass="highlight",
+            style="github-dark",
+        )
+        highlighted = highlight(content, lexer, formatter)
+        css = formatter.get_style_defs(".highlight")
+        return f"<style>{css}</style>{highlighted}"
+    except Exception:  # pylint: disable=broad-except
+        # Fallback: plain pre with line numbers
+        import html  # pylint: disable=import-outside-toplevel
+        escaped = html.escape(content)
+        lines = escaped.split("\n")
+        numbered = "".join(
+            f'<span style="color:#586069;padding-right:1rem;'
+            f'user-select:none;">{i + 1:4}</span>{line}\n'
+            for i, line in enumerate(lines)
+        )
+        return (
+            f'<pre style="margin:0;padding:1rem;font-size:0.85rem;'
+            f'line-height:1.5;overflow-x:auto;">{numbered}</pre>'
+        )
 
 
 def _render_repo_page(  # pylint: disable=too-many-locals
