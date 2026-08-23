@@ -999,6 +999,16 @@ def _get_page_content(path: str, user_info: dict) -> str:
             if len(parts) == 2:
                 return _render_commits_page(parts[0], parts[1], username)
 
+    # /groups/<group>/<repo>/pulls — pull requests page
+    if (
+        path.startswith("/groups/")
+        and path.endswith("/pulls")
+        and "/tree/" not in path
+    ):
+        parts = path[8:].rsplit("/pulls", 1)[0].split("/", 1)
+        if len(parts) == 2:
+            return _render_pulls_page(parts[0], parts[1], username)
+
     # /groups/<group>/<repo>/branches — branches page (not inside /tree/)
     if (
         path.startswith("/groups/")
@@ -1085,6 +1095,102 @@ def _render_user_groups_page(username: str) -> str:
         </tr>
       </thead>
       <tbody id="user-groups-table">
+        {rows}
+      </tbody>
+    </table>"""
+
+
+def _render_pulls_page(
+    group: str, repo_name: str, username: str,
+) -> str:
+    """Render the pull requests list page.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        username: Authenticated user.
+
+    Returns:
+        HTML content.
+    """
+    from gitgateway.db import check_permission  # pylint: disable=import-outside-toplevel
+    from gitgateway.pullrequest import list_prs  # pylint: disable=import-outside-toplevel
+    from gitgateway.models import AccessLevel  # pylint: disable=import-outside-toplevel
+
+    if not check_permission(username, group, repo_name):
+        return "<h1>403 Forbidden</h1>"
+
+    is_admin = check_permission(
+        username, group, repo_name, required_level=AccessLevel.ADMIN,
+    )
+
+    # Get all PRs
+    prs = list_prs(group, repo_name)
+
+    # Build rows
+    rows = ""
+    for pr in prs:
+        status = pr.status.value
+        color = {
+            "open": "#2ea44f", "merged": "#6f42c1", "closed": "#cb2431",
+        }.get(status, "#586069")
+        rows += f"""<tr style="border-bottom:1px solid #f0f0f0;">
+          <td style="padding:0.75rem;">
+            <div>
+              <span style="color:{color};font-weight:bold;
+                margin-right:0.5rem;">{status.capitalize()}</span>
+              <strong>{pr.title}</strong>
+              <span style="color:#586069;"> #{pr.number}</span>
+            </div>
+            <div style="color:#586069;font-size:0.85rem;margin-top:0.2rem;">
+              {pr.author or 'unknown'} wants to merge
+              <code>{pr.source_branch}</code> into
+              <code>{pr.target_branch}</code>
+            </div>
+          </td>
+        </tr>"""
+
+    if not rows:
+        rows = """<tr><td style="padding:2rem;color:#586069;
+          text-align:center;">No pull requests yet.</td></tr>"""
+
+    # Settings gear
+    settings_link = ""
+    if is_admin:
+        settings_link = (
+            f'<a href="/groups/{group}/{repo_name}/settings" '
+            f'title="Settings" style="font-size:1.2rem;">⚙️</a>'
+        )
+
+    return f"""
+    <div style="display:flex;justify-content:space-between;
+      align-items:center;margin-bottom:1rem;">
+      <h1 style="margin:0;">
+        <a href="/groups/{group}" style="color:#586069;
+          font-weight:normal;">{group}</a> /
+        <a href="/groups/{group}/{repo_name}">{repo_name}</a>
+      </h1>
+      {settings_link}
+    </div>
+
+    <div style="display:flex;gap:1rem;border-bottom:1px solid #e1e4e8;
+      margin-bottom:1.5rem;">
+      <a href="/groups/{group}/{repo_name}"
+        style="padding:0.5rem 1rem;color:#586069;">Code</a>
+      <a href="/groups/{group}/{repo_name}/pulls"
+        style="padding:0.5rem 1rem;font-weight:600;
+        border-bottom:2px solid #f9826c;">Pull Requests</a>
+      <a href="/groups/{group}/{repo_name}/commits"
+        style="padding:0.5rem 1rem;color:#586069;">Commits</a>
+      <a href="/groups/{group}/{repo_name}/branches"
+        style="padding:0.5rem 1rem;color:#586069;">Branches</a>
+    </div>
+
+    <h2 style="margin-bottom:1rem;">Pull Requests</h2>
+
+    <table style="width:100%;border-collapse:collapse;
+      border:1px solid #e1e4e8;border-radius:6px;">
+      <tbody>
         {rows}
       </tbody>
     </table>"""
