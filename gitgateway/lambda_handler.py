@@ -914,14 +914,24 @@ def _get_page_content(path: str, user_info: dict) -> str:
             return _render_repo_settings_page(parts[0], parts[1], username)
 
     # /groups/<group>/<repo>/commits — commit history (not inside /tree/)
+    # Also handles /groups/<group>/<repo>/commits/<branch>
     if (
         path.startswith("/groups/")
-        and path.endswith("/commits")
+        and "/commits" in path
         and "/tree/" not in path
     ):
-        parts = path[8:].rsplit("/commits", 1)[0].split("/", 1)
-        if len(parts) == 2:
-            return _render_commits_page(parts[0], parts[1], username)
+        after = path[8:]
+        if "/commits/" in after:
+            before_commits, branch_part = after.split("/commits/", 1)
+            parts = before_commits.split("/", 1)
+            if len(parts) == 2:
+                return _render_commits_page(
+                    parts[0], parts[1], username, branch_part,
+                )
+        elif after.endswith("/commits"):
+            parts = after.rsplit("/commits", 1)[0].split("/", 1)
+            if len(parts) == 2:
+                return _render_commits_page(parts[0], parts[1], username)
 
     # /groups/<group>/<repo>/tree/<branch>/... — file tree at branch
     if "/tree/" in path and path.startswith("/groups/"):
@@ -1004,16 +1014,17 @@ def _render_user_groups_page(username: str) -> str:
 
 
 def _render_commits_page(
-    group: str, repo_name: str, username: str,
+    group: str, repo_name: str, username: str, branch: str = "",
 ) -> str:
     """Render the commits history page for a repository.
 
-    Shows all commits on the default branch, sorted newest first.
+    Shows all commits on the selected branch, sorted newest first.
 
     Args:
         group: Group name.
         repo_name: Repository name.
         username: Authenticated user.
+        branch: Branch to show commits for (default: repo's default branch).
 
     Returns:
         HTML content.
@@ -1034,18 +1045,38 @@ def _render_commits_page(
         return "<h1>404 Not Found</h1>"
 
     default_branch = repo.default_branch or "main"
+    current_branch = branch or default_branch
     is_admin = check_permission(
         username, group, repo_name, required_level=AccessLevel.ADMIN,
     )
 
-    # Get commits from DynamoDB
+    # Get available branches
     table = boto3.resource("dynamodb").Table("gitgateway-repos")
+    branches_response = table.query(
+        KeyConditionExpression=(
+            "PK = :pk AND begins_with(SK, :prefix)"
+        ),
+        ExpressionAttributeValues={
+            ":pk": f"BRANCHES#{group}/{repo_name}",
+            ":prefix": "BRANCH#",
+        },
+    )
+    branches = [
+        item.get("branch_name", "") for item in
+        branches_response.get("Items", [])
+    ]
+    if not branches:
+        branches = [default_branch]
+    if current_branch not in branches:
+        branches.insert(0, current_branch)
+
+    # Get commits from DynamoDB
     response = table.query(
         KeyConditionExpression=(
             "PK = :pk AND begins_with(SK, :prefix)"
         ),
         ExpressionAttributeValues={
-            ":pk": f"COMMITS#{group}/{repo_name}#{default_branch}",
+            ":pk": f"COMMITS#{group}/{repo_name}#{current_branch}",
             ":prefix": "COMMIT#",
         },
     )
@@ -1112,14 +1143,32 @@ def _render_commits_page(
         border-bottom:2px solid #f9826c;">Commits</a>
     </div>
 
-    <h2>Commits on <code>{default_branch}</code></h2>
+    <div style="display:flex;align-items:center;gap:1rem;margin-bottom:1rem;">
+      <select id="branch-select" onchange="switchBranch(this.value)"
+        style="padding:0.4rem 0.8rem;border-radius:6px;
+        border:1px solid #d1d5da;font-size:0.9rem;">
+        {''.join(
+            f'<option value="{b}"'
+            f'{" selected" if b == current_branch else ""}>'
+            f'{b}</option>'
+            for b in branches
+        )}
+      </select>
+      <h2 style="margin:0;">Commits on <code>{current_branch}</code></h2>
+    </div>
 
     <table style="width:100%;border-collapse:collapse;margin-top:1rem;
       border:1px solid #e1e4e8;border-radius:6px;">
       <tbody>
         {rows}
       </tbody>
-    </table>"""
+    </table>
+
+    <script>
+    function switchBranch(branch) {{
+      window.location.href = '/groups/{group}/{repo_name}/commits/' + branch;
+    }}
+    </script>"""
 
 
 def _render_repo_settings_page(
