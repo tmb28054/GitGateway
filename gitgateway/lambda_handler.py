@@ -413,6 +413,73 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
                 headers=headers,
             )
 
+    # POST /api/repos/<group>/<repo>/branches — register a branch
+    if (
+        path.startswith("/api/repos/")
+        and path.endswith("/branches")
+        and method == "POST"
+    ):
+        branch_path = path[len("/api/repos/"):-len("/branches")]
+        parts = branch_path.split("/", 1)
+        if len(parts) == 2:
+            try:
+                body = json.loads(request.body.decode()) if request.body else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return Response(
+                    status_code=400,
+                    body=json.dumps({"error": "Invalid JSON"}),
+                    headers=headers,
+                )
+            branch_name = body.get("branch", "")
+            if not branch_name:
+                return Response(
+                    status_code=400,
+                    body=json.dumps({"error": "branch is required"}),
+                    headers=headers,
+                )
+            import boto3 as _boto3  # pylint: disable=import-outside-toplevel
+            tbl = _boto3.resource("dynamodb").Table("gitgateway-repos")
+            tbl.put_item(Item={
+                "PK": f"BRANCHES#{parts[0]}/{parts[1]}",
+                "SK": f"BRANCH#{branch_name}",
+                "branch_name": branch_name,
+            })
+            return Response(
+                status_code=201,
+                body=json.dumps({"branch": branch_name}),
+                headers=headers,
+            )
+
+    # GET /api/repos/<group>/<repo>/branches — list branches
+    if (
+        path.startswith("/api/repos/")
+        and path.endswith("/branches")
+        and method == "GET"
+    ):
+        branch_path = path[len("/api/repos/"):-len("/branches")]
+        parts = branch_path.split("/", 1)
+        if len(parts) == 2:
+            import boto3 as _boto3  # pylint: disable=import-outside-toplevel
+            tbl = _boto3.resource("dynamodb").Table("gitgateway-repos")
+            resp = tbl.query(
+                KeyConditionExpression=(
+                    "PK = :pk AND begins_with(SK, :prefix)"
+                ),
+                ExpressionAttributeValues={
+                    ":pk": f"BRANCHES#{parts[0]}/{parts[1]}",
+                    ":prefix": "BRANCH#",
+                },
+            )
+            branch_list = [
+                item.get("branch_name", "")
+                for item in resp.get("Items", [])
+            ]
+            return Response(
+                status_code=200,
+                body=json.dumps(branch_list),
+                headers=headers,
+            )
+
     # POST /api/repos/<group> — create repo
     if path.startswith("/api/repos/") and method == "POST":
         group_name = path[len("/api/repos/"):]
@@ -1215,8 +1282,29 @@ def _render_repo_page(  # pylint: disable=too-many-locals
 
     clone_url = f"https://git.botthouse.net/{group}/{repo_name}.git"
 
-    # Get file tree from DynamoDB cache
+    # Get DynamoDB table for tree and branches
     table = boto3.resource("dynamodb").Table("gitgateway-repos")
+
+    # Get available branches from DynamoDB
+    branches_response = table.query(
+        KeyConditionExpression=(
+            "PK = :pk AND begins_with(SK, :prefix)"
+        ),
+        ExpressionAttributeValues={
+            ":pk": f"BRANCHES#{group}/{repo_name}",
+            ":prefix": "BRANCH#",
+        },
+    )
+    branches = [
+        item.get("branch_name", "") for item in
+        branches_response.get("Items", [])
+    ]
+    if not branches:
+        branches = [default_branch]
+    if current_branch not in branches:
+        branches.insert(0, current_branch)
+
+    # Get file tree from DynamoDB cache
     tree_response = table.query(
         KeyConditionExpression=(
             "PK = :pk AND begins_with(SK, :prefix)"
@@ -1368,8 +1456,12 @@ def _render_repo_page(  # pylint: disable=too-many-locals
         <select id="branch-select" onchange="switchBranch(this.value)"
           style="padding:0.4rem 0.8rem;border-radius:6px;
           border:1px solid #d1d5da;font-size:0.9rem;">
-          <option value="{current_branch}" selected>
-            {current_branch}</option>
+          {''.join(
+              f'<option value="{b}"'
+              f'{" selected" if b == current_branch else ""}>'
+              f'{b}</option>'
+              for b in branches
+          )}
         </select>
         <span style="color:#586069;font-size:0.85rem;">{breadcrumb}</span>
       </div>
