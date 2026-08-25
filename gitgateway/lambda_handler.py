@@ -1445,7 +1445,7 @@ def _render_pr_detail_page(
             <strong>{c.author}</strong>
             <span style="color:#586069;"> commented {c.created_at}</span>
           </div>
-          <div style="padding:0.75rem 1rem;">{c.body}</div>
+          <div style="padding:0.75rem 1rem;">{_render_markdown(c.body)}</div>
         </div>"""
 
     # Build reviews section
