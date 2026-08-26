@@ -292,6 +292,27 @@ def _dispatch(handler_name: str, request: Request) -> Response:
         repo_name = match.group(2)
         git_path = "/" + match.group(3)
 
+        # Authenticate via Basic auth
+        git_user = _authenticate_git_request(request)
+        if git_user is None:
+            return Response(
+                status_code=401,
+                body=b"Authentication required",
+                headers={
+                    "Content-Type": "text/plain",
+                    "WWW-Authenticate": 'Basic realm="GitGateway"',
+                },
+            )
+
+        # Check access: push requires read/write scope
+        is_push = "git-receive-pack" in git_path
+        if is_push and git_user.get("scope") == "read":
+            return Response(
+                status_code=403,
+                body=b"Token scope is read-only; push requires read/write",
+                headers={"Content-Type": "text/plain"},
+            )
+
         status, ctype, resp_body = handle_git_http_request(
             method=request.method,
             path_info=git_path,
@@ -893,6 +914,88 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
                 headers=headers,
             )
 
+    # POST /api/tokens — create a personal access token
+    if path == "/api/tokens" and method == "POST":
+        from gitgateway.tokens import (  # pylint: disable=import-outside-toplevel
+            generate_token, TokenScope,
+        )
+        try:
+            body = json.loads(request.body.decode()) if request.body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = {}
+        description = body.get("description", "").strip()
+        scope_str = body.get("scope", "read/write")
+        expiry_days = int(body.get("expiry_days", 365))
+        username = _get_request_username(request)
+        if not username:
+            return Response(
+                status_code=401,
+                body=json.dumps({"error": "Authentication required"}),
+                headers=headers,
+            )
+        try:
+            scope = TokenScope(scope_str)
+        except ValueError:
+            scope = TokenScope.READ_WRITE
+        raw_token, pat = generate_token(
+            username=username,
+            description=description,
+            scope=scope,
+            expiry_days=expiry_days,
+        )
+        result = pat.to_dict()
+        result["token"] = raw_token  # Only returned once
+        return Response(
+            status_code=201,
+            body=json.dumps(result),
+            headers=headers,
+        )
+
+    # GET /api/tokens — list current user's tokens
+    if path == "/api/tokens" and method == "GET":
+        from gitgateway.tokens import list_tokens  # pylint: disable=import-outside-toplevel
+        username = _get_request_username(request)
+        if not username:
+            return Response(
+                status_code=401,
+                body=json.dumps({"error": "Authentication required"}),
+                headers=headers,
+            )
+        tokens = list_tokens(username)
+        return Response(
+            status_code=200,
+            body=json.dumps([t.to_dict() for t in tokens]),
+            headers=headers,
+        )
+
+    # DELETE /api/tokens/<token_id> — revoke a token
+    token_del_match = re.match(r"^/api/tokens/([a-f0-9]+)$", path)
+    if token_del_match and method == "DELETE":
+        from gitgateway.tokens import (  # pylint: disable=import-outside-toplevel
+            revoke_token, TokenNotFoundError,
+        )
+        username = _get_request_username(request)
+        if not username:
+            return Response(
+                status_code=401,
+                body=json.dumps({"error": "Authentication required"}),
+                headers=headers,
+            )
+        token_id = token_del_match.group(1)
+        try:
+            revoke_token(username, token_id)
+            return Response(
+                status_code=200,
+                body=json.dumps({"message": f"Token {token_id} revoked"}),
+                headers=headers,
+            )
+        except TokenNotFoundError:
+            return Response(
+                status_code=404,
+                body=json.dumps({"error": "Token not found"}),
+                headers=headers,
+            )
+
     # POST /api/admin/ai-key — update Gemini API key
     if path == "/api/admin/ai-key" and method == "POST":
         import boto3 as _boto3  # pylint: disable=import-outside-toplevel
@@ -1102,6 +1205,8 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
           style="background:none;border:1px solid #555;border-radius:4px;
           padding:0.2rem 0.5rem;cursor:pointer;font-size:0.9rem;"
           title="Toggle dark mode">🌙</button>
+        <a href="/tokens" style="color:#ccc;text-decoration:none;"
+          title="Personal Access Tokens">Tokens</a>
         <span style="color:#ccc;">{username}</span>
         <a href="/logout" style="color:#f97583;text-decoration:none;">
           Logout</a>
@@ -1200,6 +1305,9 @@ def _get_page_content(path: str, user_info: dict, query_string: str = "") -> str
     if path == "/groups":
         return _render_user_groups_page(username)
 
+    if path == "/tokens":
+        return _render_tokens_page(username)
+
     if path.startswith("/groups/") and "/" not in path[8:]:
         group_name = path[8:]
         return _render_group_detail_page(group_name, username)
@@ -1258,7 +1366,9 @@ def _get_page_content(path: str, user_info: dict, query_string: str = "") -> str
     ):
         parts = path[8:].rsplit("/pulls", 1)[0].split("/", 1)
         if len(parts) == 2:
-            return _render_pulls_page(parts[0], parts[1], username)
+            return _render_pulls_page(
+                parts[0], parts[1], username, query_string,
+            )
 
     # /groups/<group>/<repo>/pulls/<number> — PR detail page
     if (
@@ -1558,6 +1668,74 @@ def _render_side_by_side_diff(entry: dict) -> str:
         "</colgroup>"
         f"{rows}</table>"
     )
+
+
+def _get_request_username(request: Request) -> str:
+    """Extract the authenticated username from a request.
+
+    Uses the session cookie to identify the user.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Username string, or empty string if not authenticated.
+    """
+    try:
+        user_info = _get_session_user(request)
+        return user_info.get("username", "")
+    except Exception:  # pylint: disable=broad-except
+        return ""
+
+
+def _authenticate_git_request(request: Request) -> dict | None:
+    """Authenticate a git HTTP request via Basic auth.
+
+    Accepts two credential types:
+    1. __token__ + JWT (short-lived, for CI/automation)
+    2. __token__ + Personal Access Token (long-lived, for developers)
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Dict with 'username' and 'scope' if valid, None if auth fails.
+    """
+    import base64  # pylint: disable=import-outside-toplevel
+    import os as _os  # pylint: disable=import-outside-toplevel
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Basic "):
+        return None
+
+    try:
+        decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+    if username != "__token__":
+        return None
+
+    # Try JWT validation first
+    idp_url = _os.environ.get("IDP_URL", "")
+    if idp_url:
+        try:
+            from gitgateway.auth import validate_jwt  # pylint: disable=import-outside-toplevel
+            user = validate_jwt(password, idp_url)
+            return {"username": user.username, "scope": "read/write"}
+        except Exception:  # pylint: disable=broad-except
+            pass  # Not a valid JWT, try API key
+
+    # Try Personal Access Token
+    try:
+        from gitgateway.tokens import (  # pylint: disable=import-outside-toplevel
+            validate_token, TokenError,
+        )
+        pat = validate_token(password)
+        return {"username": pat.username, "scope": pat.scope.value}
+    except TokenError:
+        return None
 
 
 def _is_whitespace_only_diff(entry: dict) -> bool:
@@ -1865,13 +2043,15 @@ def _render_pr_detail_page(
 
 def _render_pulls_page(
     group: str, repo_name: str, username: str,
+    query_string: str = "",
 ) -> str:
-    """Render the pull requests list page.
+    """Render the pull requests list page with status filter.
 
     Args:
         group: Group name.
         repo_name: Repository name.
         username: Authenticated user.
+        query_string: Raw query string for status filter.
 
     Returns:
         HTML content.
@@ -1887,8 +2067,50 @@ def _render_pulls_page(
         username, group, repo_name, required_level=AccessLevel.ADMIN,
     )
 
+    # Parse status filter from query string (default: open)
+    status_filter = "open"
+    for param in query_string.split("&"):
+        if param.startswith("status="):
+            status_filter = param[7:]
+
     # Get all PRs
     prs = list_prs(group, repo_name)
+
+    # Filter by status
+    if status_filter != "all":
+        prs = [pr for pr in prs if pr.status.value == status_filter]
+
+    # Build filter buttons
+    def _btn(label, value):
+        active = status_filter == value
+        style = (
+            "padding:0.4rem 1rem;border:1px solid #e1e4e8;"
+            "border-radius:20px;text-decoration:none;font-size:0.875rem;"
+        )
+        if active:
+            style += "background:#0366d6;color:#fff;font-weight:600;"
+        else:
+            style += "background:#fff;color:#586069;"
+        url = f"/groups/{group}/{repo_name}/pulls?status={value}"
+        return f'<a href="{url}" style="{style}">{label}</a>'
+
+    open_count = len([
+        p for p in list_prs(group, repo_name)
+        if p.status.value == "open"
+    ])
+    closed_count = len([
+        p for p in list_prs(group, repo_name)
+        if p.status.value in ("closed", "merged")
+    ])
+
+    filter_bar = (
+        '<div style="display:flex;gap:0.5rem;margin-bottom:1.5rem;">'
+        + _btn(f"Open ({open_count})", "open")
+        + _btn(f"Closed ({closed_count})", "closed")
+        + _btn("Merged", "merged")
+        + _btn("All", "all")
+        + "</div>"
+    )
 
     # Build rows
     rows = ""
@@ -1915,8 +2137,14 @@ def _render_pulls_page(
         </tr>"""
 
     if not rows:
-        rows = """<tr><td style="padding:2rem;color:#586069;
-          text-align:center;">No pull requests yet.</td></tr>"""
+        no_msg = {
+            "open": "No open pull requests.",
+            "closed": "No closed pull requests.",
+            "merged": "No merged pull requests.",
+            "all": "No pull requests yet.",
+        }.get(status_filter, "No pull requests.")
+        rows = f"""<tr><td style="padding:2rem;color:#586069;
+          text-align:center;">{no_msg}</td></tr>"""
 
     # Settings gear
     settings_link = ""
@@ -1951,6 +2179,7 @@ def _render_pulls_page(
     </div>
 
     <h2 style="margin-bottom:1rem;">Pull Requests</h2>
+    {filter_bar}
 
     <table style="width:100%;border-collapse:collapse;
       border:1px solid #e1e4e8;border-radius:6px;">
@@ -3754,6 +3983,190 @@ def _handle_auth_callback(request: Request, idp_url: str) -> Response:
             ),
         },
     )
+
+
+def _render_tokens_page(username: str) -> str:
+    """Render the Personal Access Tokens management page.
+
+    Shows existing tokens with revoke buttons and a form to create
+    new tokens.
+
+    Args:
+        username: Authenticated user.
+
+    Returns:
+        HTML content.
+    """
+    from gitgateway.tokens import list_tokens  # pylint: disable=import-outside-toplevel
+
+    tokens = list_tokens(username)
+
+    # Build token rows
+    token_rows = ""
+    for token in tokens:
+        status_badge = ""
+        if token.revoked:
+            status_badge = (
+                '<span style="background:#cb2431;color:#fff;'
+                'padding:0.1rem 0.4rem;border-radius:3px;'
+                'font-size:0.75rem;">Revoked</span>'
+            )
+        elif token.is_expired():
+            status_badge = (
+                '<span style="background:#dbab09;color:#fff;'
+                'padding:0.1rem 0.4rem;border-radius:3px;'
+                'font-size:0.75rem;">Expired</span>'
+            )
+        else:
+            status_badge = (
+                '<span style="background:#2ea44f;color:#fff;'
+                'padding:0.1rem 0.4rem;border-radius:3px;'
+                'font-size:0.75rem;">Active</span>'
+            )
+
+        revoke_btn = ""
+        if not token.revoked:
+            revoke_btn = (
+                f'<button onclick="revokeToken(\'{token.token_id}\')"'
+                f' style="background:#cb2431;color:#fff;border:none;'
+                f'padding:0.3rem 0.8rem;border-radius:4px;'
+                f'cursor:pointer;font-size:0.8rem;">Revoke</button>'
+            )
+
+        last_used = token.last_used_at[:10] if token.last_used_at else "Never"
+        expires = token.expires_at[:10] if token.expires_at else "Never"
+
+        token_rows += f"""
+        <tr style="border-bottom:1px solid #e1e4e8;">
+          <td style="padding:0.75rem;">
+            <strong>{token.description or 'Unnamed token'}</strong>
+            <div style="color:#586069;font-size:0.8rem;margin-top:0.2rem;">
+              ID: <code>{token.token_id}</code> · Scope: {token.scope.value}
+            </div>
+          </td>
+          <td style="padding:0.75rem;text-align:center;">{status_badge}</td>
+          <td style="padding:0.75rem;color:#586069;font-size:0.85rem;">
+            {expires}</td>
+          <td style="padding:0.75rem;color:#586069;font-size:0.85rem;">
+            {last_used}</td>
+          <td style="padding:0.75rem;text-align:right;">{revoke_btn}</td>
+        </tr>"""
+
+    if not token_rows:
+        token_rows = """
+        <tr><td colspan="5" style="padding:2rem;color:#586069;
+          text-align:center;">No tokens created yet.</td></tr>"""
+
+    return f"""
+    <h1>Personal Access Tokens</h1>
+    <p style="color:#586069;margin-bottom:1.5rem;">
+      Tokens are used to authenticate git operations (clone, push, fetch).
+      Use <code>__token__</code> as the username and your token as the password.
+    </p>
+
+    <div style="border:1px solid #e1e4e8;border-radius:6px;
+                padding:1.5rem;margin-bottom:2rem;background:#f6f8fa;">
+      <h3 style="margin:0 0 1rem 0;">Create New Token</h3>
+      <form id="token-form" style="display:flex;flex-wrap:wrap;gap:0.75rem;
+                                    align-items:flex-end;">
+        <div style="flex:1;min-width:200px;">
+          <label for="token-desc" style="display:block;font-size:0.85rem;
+            margin-bottom:0.25rem;">Description</label>
+          <input type="text" id="token-desc" placeholder="e.g. Laptop dev"
+            style="width:100%;padding:0.4rem;border:1px solid #d1d5da;
+            border-radius:4px;" />
+        </div>
+        <div>
+          <label for="token-scope" style="display:block;font-size:0.85rem;
+            margin-bottom:0.25rem;">Scope</label>
+          <select id="token-scope" style="padding:0.4rem;border:1px solid #d1d5da;
+            border-radius:4px;">
+            <option value="read/write">Read/Write (push + pull)</option>
+            <option value="read">Read Only (pull only)</option>
+          </select>
+        </div>
+        <div>
+          <label for="token-expiry" style="display:block;font-size:0.85rem;
+            margin-bottom:0.25rem;">Expires in (days)</label>
+          <input type="number" id="token-expiry" value="365" min="1" max="3650"
+            style="width:80px;padding:0.4rem;border:1px solid #d1d5da;
+            border-radius:4px;" />
+        </div>
+        <button type="submit"
+          style="padding:0.5rem 1.5rem;background:#2ea44f;color:#fff;
+          border:none;border-radius:4px;cursor:pointer;font-weight:500;">
+          Generate Token
+        </button>
+      </form>
+      <div id="token-result" style="margin-top:1rem;"></div>
+    </div>
+
+    <h3>Your Tokens</h3>
+    <table style="width:100%;border-collapse:collapse;
+      border:1px solid #e1e4e8;border-radius:6px;">
+      <thead>
+        <tr style="background:#f6f8fa;border-bottom:1px solid #e1e4e8;">
+          <th style="padding:0.5rem 0.75rem;text-align:left;">Token</th>
+          <th style="padding:0.5rem 0.75rem;text-align:center;">Status</th>
+          <th style="padding:0.5rem 0.75rem;text-align:left;">Expires</th>
+          <th style="padding:0.5rem 0.75rem;text-align:left;">Last Used</th>
+          <th style="padding:0.5rem 0.75rem;"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {token_rows}
+      </tbody>
+    </table>
+
+    <div style="margin-top:2rem;padding:1rem;border:1px solid #e1e4e8;
+      border-radius:6px;background:#fffbdd;">
+      <h4 style="margin:0 0 0.5rem 0;">Usage</h4>
+      <p style="margin:0;font-size:0.9rem;">Configure git credentials:</p>
+      <pre style="background:#f6f8fa;padding:0.75rem;border-radius:4px;
+        margin-top:0.5rem;font-size:0.8rem;overflow-x:auto;">git clone https://__token__:YOUR_TOKEN@git.botthouse.net/group/repo.git</pre>
+    </div>
+
+    <script>
+    document.getElementById('token-form').addEventListener('submit', async (e) => {{
+      e.preventDefault();
+      const desc = document.getElementById('token-desc').value.trim();
+      const scope = document.getElementById('token-scope').value;
+      const expiry = document.getElementById('token-expiry').value;
+      const result = document.getElementById('token-result');
+
+      const resp = await fetch('/api/tokens', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{description: desc, scope: scope, expiry_days: parseInt(expiry)}})
+      }});
+
+      if (resp.ok) {{
+        const data = await resp.json();
+        result.innerHTML = `
+          <div style="background:#dcffe4;border:1px solid #34d058;padding:1rem;
+            border-radius:6px;">
+            <strong>Token created!</strong> Copy it now — it won't be shown again.
+            <div style="margin-top:0.5rem;font-family:monospace;background:#fff;
+              padding:0.5rem;border-radius:4px;word-break:break-all;
+              border:1px solid #e1e4e8;">
+              ${{data.token}}
+            </div>
+          </div>`;
+        setTimeout(() => location.reload(), 5000);
+      }} else {{
+        const data = await resp.json();
+        result.innerHTML = '<span style="color:#cb2431;">' +
+          (data.error || 'Failed to create token') + '</span>';
+      }}
+    }});
+
+    async function revokeToken(tokenId) {{
+      if (!confirm('Revoke this token? This cannot be undone.')) return;
+      const resp = await fetch('/api/tokens/' + tokenId, {{method: 'DELETE'}});
+      if (resp.ok) {{ location.reload(); }}
+      else {{ alert('Failed to revoke token'); }}
+    }}
+    </script>"""
 
 
 def _render_admin_ai_page() -> str:
