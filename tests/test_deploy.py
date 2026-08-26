@@ -45,21 +45,35 @@ class TestBuildParameters:
             "git.example.com",
             "arn:aws:acm:us-east-1:123:cert/abc",
             True, False,
+            "my-bucket", "lambda-packages/abc.zip", "",
+            core_layer_arn="arn:layer:core:1",
+            linting_layer_arn="arn:layer:linting:1",
+            binaries_layer_arn="arn:layer:binaries:1",
         )
         keys = {p["ParameterKey"] for p in params}
         assert "DomainName" in keys
         assert "ACMCertificateARN" in keys
         assert "EnableCodeBuild" in keys
         assert "EnableAI" in keys
+        assert "CoreLayerArn" in keys
+        assert "LintingLayerArn" in keys
+        assert "BinariesLayerArn" in keys
 
         domain_param = next(
             p for p in params if p["ParameterKey"] == "DomainName"
         )
         assert domain_param["ParameterValue"] == "git.example.com"
 
+        core_param = next(
+            p for p in params if p["ParameterKey"] == "CoreLayerArn"
+        )
+        assert core_param["ParameterValue"] == "arn:layer:core:1"
+
     def test_boolean_values(self) -> None:
         """Converts booleans to lowercase strings."""
-        params = _build_parameters("d", "a", False, True)
+        params = _build_parameters(
+            "d", "a", False, True, "b", "k", "",
+        )
         cb = next(
             p for p in params if p["ParameterKey"] == "EnableCodeBuild"
         )
@@ -142,8 +156,14 @@ class TestDeployStack:
         with pytest.raises(DeployError, match="ACMCertificateARN"):
             deploy_stack("stack", "domain.com", "")
 
+    @patch("gitgateway.deploy._publish_layer")
+    @patch("gitgateway.deploy._package_binary_layer")
+    @patch("gitgateway.deploy._package_layer")
+    @patch("gitgateway.deploy.package_lambda")
     @patch("gitgateway.deploy.boto3.Session")
-    def test_creates_new_stack(self, mock_session) -> None:
+    def test_creates_new_stack(
+        self, mock_session, mock_pkg, mock_layer, mock_binary, mock_publish,
+    ) -> None:
         """Creates a new stack when it doesn't exist."""
         mock_client = MagicMock()
         mock_client.exceptions.ClientError = Exception
@@ -159,6 +179,17 @@ class TestDeployStack:
 
         mock_session.return_value.client.return_value = mock_client
 
+        # Mock packaging
+        from pathlib import Path
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        fake_zip = tmp / "lambda.zip"
+        fake_zip.write_bytes(b"fake")
+        mock_pkg.return_value = fake_zip
+        mock_layer.return_value = fake_zip
+        mock_binary.return_value = fake_zip
+        mock_publish.return_value = "arn:aws:lambda:us-east-1:123:layer:test:1"
+
         result = deploy_stack(
             "gitgateway", "git.example.com",
             "arn:aws:acm:us-east-1:123:cert/abc",
@@ -167,8 +198,14 @@ class TestDeployStack:
         mock_client.create_stack.assert_called_once()
         assert result["api_url"] == "https://new"
 
+    @patch("gitgateway.deploy._publish_layer")
+    @patch("gitgateway.deploy._package_binary_layer")
+    @patch("gitgateway.deploy._package_layer")
+    @patch("gitgateway.deploy.package_lambda")
     @patch("gitgateway.deploy.boto3.Session")
-    def test_updates_existing_stack(self, mock_session) -> None:
+    def test_updates_existing_stack(
+        self, mock_session, mock_pkg, mock_layer, mock_binary, mock_publish,
+    ) -> None:
         """Updates an existing stack."""
         mock_client = MagicMock()
         mock_client.exceptions.ClientError = Exception
@@ -181,14 +218,30 @@ class TestDeployStack:
 
         mock_session.return_value.client.return_value = mock_client
 
+        from pathlib import Path
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        fake_zip = tmp / "lambda.zip"
+        fake_zip.write_bytes(b"fake")
+        mock_pkg.return_value = fake_zip
+        mock_layer.return_value = fake_zip
+        mock_binary.return_value = fake_zip
+        mock_publish.return_value = "arn:aws:lambda:us-east-1:123:layer:test:1"
+
         deploy_stack(
             "gitgateway", "x.com", "arn:cert",
             profile="prod",
         )
         mock_client.update_stack.assert_called_once()
 
+    @patch("gitgateway.deploy._publish_layer")
+    @patch("gitgateway.deploy._package_binary_layer")
+    @patch("gitgateway.deploy._package_layer")
+    @patch("gitgateway.deploy.package_lambda")
     @patch("gitgateway.deploy.boto3.Session")
-    def test_no_updates_needed(self, mock_session) -> None:
+    def test_no_updates_needed(
+        self, mock_session, mock_pkg, mock_layer, mock_binary, mock_publish,
+    ) -> None:
         """Handles 'no updates' gracefully."""
         mock_client = MagicMock()
         mock_client.exceptions.ClientError = Exception
@@ -203,12 +256,27 @@ class TestDeployStack:
 
         mock_session.return_value.client.return_value = mock_client
 
+        from pathlib import Path
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        fake_zip = tmp / "lambda.zip"
+        fake_zip.write_bytes(b"fake")
+        mock_pkg.return_value = fake_zip
+        mock_layer.return_value = fake_zip
+        mock_binary.return_value = fake_zip
+        mock_publish.return_value = "arn:aws:lambda:us-east-1:123:layer:test:1"
+
         result = deploy_stack("stack", "d.com", "arn:c")
         assert result == {}
 
-
+    @patch("gitgateway.deploy._publish_layer")
+    @patch("gitgateway.deploy._package_binary_layer")
+    @patch("gitgateway.deploy._package_layer")
+    @patch("gitgateway.deploy.package_lambda")
     @patch("gitgateway.deploy.boto3.Session")
-    def test_deployment_failure_raises(self, mock_session) -> None:
+    def test_deployment_failure_raises(
+        self, mock_session, mock_pkg, mock_layer, mock_binary, mock_publish,
+    ) -> None:
         """Raises DeployError on actual failure."""
         mock_client = MagicMock()
         mock_client.exceptions.ClientError = Exception
@@ -221,6 +289,16 @@ class TestDeployStack:
         )
 
         mock_session.return_value.client.return_value = mock_client
+
+        from pathlib import Path
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        fake_zip = tmp / "lambda.zip"
+        fake_zip.write_bytes(b"fake")
+        mock_pkg.return_value = fake_zip
+        mock_layer.return_value = fake_zip
+        mock_binary.return_value = fake_zip
+        mock_publish.return_value = "arn:aws:lambda:us-east-1:123:layer:test:1"
 
         with pytest.raises(DeployError, match="Deployment failed"):
             deploy_stack("stack", "d.com", "arn:c")

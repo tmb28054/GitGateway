@@ -664,6 +664,12 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
         except Exception as exc:  # pylint: disable=broad-except
             LOG.warning("Linting failed for PR #%d: %s", pr.number, exc)
 
+        # Run AI code review (best effort)
+        try:
+            _run_ai_review(pr_group, pr_repo, pr.number, pr.source_branch)
+        except Exception as exc:  # pylint: disable=broad-except
+            LOG.warning("AI review failed for PR #%d: %s", pr.number, exc)
+
         return Response(
             status_code=201,
             body=json.dumps(pr.to_dict()),
@@ -808,6 +814,89 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
             return Response(
                 status_code=409,
                 body=json.dumps({"error": str(exc)}),
+                headers=headers,
+            )
+
+    # POST /api/<group>/<repo>/pulls/<number>/rescan — re-run linting
+    rescan_match = re.match(
+        r"^/api/([^/]+)/([^/]+)/pulls/(\d+)/rescan$", path,
+    )
+    if rescan_match and method == "POST":
+        rescan_group = rescan_match.group(1)
+        rescan_repo = rescan_match.group(2)
+        rescan_number = int(rescan_match.group(3))
+        # Look up the PR to get the source branch
+        from gitgateway.pullrequest import (  # pylint: disable=import-outside-toplevel
+            get_pr, PrNotFoundError,
+        )
+        try:
+            pr_obj = get_pr(rescan_group, rescan_repo, rescan_number)
+            _run_pr_linting(
+                rescan_group, rescan_repo,
+                rescan_number, pr_obj.source_branch,
+            )
+            _run_ai_review(
+                rescan_group, rescan_repo,
+                rescan_number, pr_obj.source_branch,
+            )
+            return Response(
+                status_code=200,
+                body=json.dumps({
+                    "message": (
+                        f"Linting and AI review triggered "
+                        f"for PR #{rescan_number}"
+                    ),
+                }),
+                headers=headers,
+            )
+        except PrNotFoundError:
+            return Response(
+                status_code=404,
+                body=json.dumps({"error": "PR not found"}),
+                headers=headers,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            return Response(
+                status_code=500,
+                body=json.dumps({"error": f"Linting failed: {exc}"}),
+                headers=headers,
+            )
+
+    # POST /api/admin/ai-key — update Gemini API key
+    if path == "/api/admin/ai-key" and method == "POST":
+        import boto3 as _boto3  # pylint: disable=import-outside-toplevel
+        try:
+            body = json.loads(request.body.decode()) if request.body else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = {}
+        api_key = body.get("api_key", "").strip()
+        if not api_key:
+            return Response(
+                status_code=400,
+                body=json.dumps({"error": "api_key is required"}),
+                headers=headers,
+            )
+        try:
+            sm = _boto3.client("secretsmanager")
+            try:
+                sm.put_secret_value(
+                    SecretId="gitgateway/gemini-api-key",
+                    SecretString=api_key,
+                )
+            except sm.exceptions.ResourceNotFoundException:
+                sm.create_secret(
+                    Name="gitgateway/gemini-api-key",
+                    SecretString=api_key,
+                )
+            return Response(
+                status_code=200,
+                body=json.dumps({"message": "API key saved"}),
+                headers=headers,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            return Response(
+                status_code=500,
+                body=json.dumps({"error": f"Failed to save: {exc}"}),
                 headers=headers,
             )
 
@@ -989,7 +1078,7 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
     </nav>"""
 
     # Route to the right page content
-    page_content = _get_page_content(request.path, user_info)
+    page_content = _get_page_content(request.path, user_info, request.query_string)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1051,12 +1140,13 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
     )
 
 
-def _get_page_content(path: str, user_info: dict) -> str:
+def _get_page_content(path: str, user_info: dict, query_string: str = "") -> str:
     """Generate page content based on the URL path.
 
     Args:
         path: The request path.
         user_info: User info dict.
+        query_string: Raw query string.
 
     Returns:
         HTML content string for the main area.
@@ -1154,6 +1244,7 @@ def _get_page_content(path: str, user_info: dict) -> str:
                     pr_num = int(pr_parts[1])
                     return _render_pr_detail_page(
                         gr_parts[0], gr_parts[1], username, pr_num,
+                        query_string=query_string,
                     )
                 except ValueError:
                     pass
@@ -1252,6 +1343,7 @@ def _render_user_groups_page(username: str) -> str:
 def _compute_pr_diff(
     group: str, repo_name: str, target_branch: str, source_branch: str,
     lint_failed_files: set | None = None,
+    ignore_whitespace: bool = False,
 ) -> str:
     """Compute the diff between target and source branches for a PR.
 
@@ -1261,6 +1353,7 @@ def _compute_pr_diff(
         target_branch: The target (base) branch.
         source_branch: The source (head) branch.
         lint_failed_files: Set of file paths that failed linting.
+        ignore_whitespace: If True, skip files with only whitespace changes.
 
     Returns:
         HTML string showing the diff.
@@ -1318,6 +1411,15 @@ def _compute_pr_diff(
     if not diff_entries:
         return '<p style="color:#586069;">No differences between branches.</p>'
 
+    # Filter whitespace-only changes if requested
+    if ignore_whitespace:
+        diff_entries = [
+            e for e in diff_entries
+            if not _is_whitespace_only_diff(e)
+        ]
+        if not diff_entries:
+            return '<p style="color:#586069;">No non-whitespace differences.</p>'
+
     # Render diff
     html = ""
     for entry in diff_entries:
@@ -1327,23 +1429,11 @@ def _compute_pr_diff(
             "modified": '<span style="background:#dbab09;color:#fff;padding:0.1rem 0.4rem;border-radius:3px;font-size:0.75rem;">Modified</span>',
         }.get(entry["status"], "")
 
-        diff_content = ""
-        if entry.get("diff"):
-            escaped = entry["diff"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            lines = escaped.split("\n")
-            colored = []
-            for line in lines:
-                if line.startswith("+"):
-                    colored.append(f'<span style="background:#e6ffed;">{line}</span>')
-                elif line.startswith("-"):
-                    colored.append(f'<span style="background:#ffeef0;">{line}</span>')
-                else:
-                    colored.append(line)
-            diff_content = "\n".join(colored)
-
         lint_icon = ""
         if lint_failed_files and entry["path"] in lint_failed_files:
             lint_icon = '<span style="color:#cb2431;margin-right:0.5rem;" title="Lint failed">✗</span>'
+
+        diff_content = _render_side_by_side_diff(entry)
 
         html += f"""
         <div style="border:1px solid #e1e4e8;border-radius:6px;margin-bottom:1rem;">
@@ -1353,15 +1443,122 @@ def _compute_pr_diff(
             <span>{lint_icon}<strong>{entry["path"]}</strong></span>
             {status_badge}
           </div>
-          <pre style="margin:0;padding:1rem;font-size:0.8rem;
-            overflow-x:auto;line-height:1.5;">{diff_content}</pre>
+          <div style="overflow-x:auto;">{diff_content}</div>
         </div>"""
 
     return html
 
 
+def _render_side_by_side_diff(entry: dict) -> str:
+    """Render a file diff as a side-by-side HTML table.
+
+    Left column shows the old (target) version, right column shows
+    the new (source) version. Added lines appear only on the right,
+    deleted lines only on the left, context on both sides.
+
+    Args:
+        entry: Dict with 'diff' and 'status' keys.
+
+    Returns:
+        HTML table string for the side-by-side diff.
+    """
+    if not entry.get("diff"):
+        return '<p style="padding:1rem;color:#586069;margin:0;">Binary or empty file</p>'
+
+    lines = entry["diff"].split("\n")
+    left_lines: list[tuple[int | str, str, str]] = []
+    right_lines: list[tuple[int | str, str, str]] = []
+
+    left_num = 0
+    right_num = 0
+
+    for line in lines:
+        escaped = (
+            line.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        if line.startswith("+"):
+            right_num += 1
+            right_lines.append((right_num, escaped, "#e6ffed"))
+            left_lines.append(("", "", "#fafbfc"))
+        elif line.startswith("-"):
+            left_num += 1
+            left_lines.append((left_num, escaped, "#ffeef0"))
+            right_lines.append(("", "", "#fafbfc"))
+        else:
+            left_num += 1
+            right_num += 1
+            left_lines.append((left_num, escaped, "#fff"))
+            right_lines.append((right_num, escaped, "#fff"))
+
+    # Build HTML table
+    rows = ""
+    cell_style = (
+        "padding:0 0.5rem;font-family:monospace;font-size:0.8rem;"
+        "white-space:pre;line-height:1.6;border-right:1px solid #e1e4e8;"
+    )
+    num_style = (
+        "padding:0 0.5rem;color:#959da5;text-align:right;"
+        "font-family:monospace;font-size:0.75rem;user-select:none;"
+        "min-width:2.5rem;border-right:1px solid #e1e4e8;"
+    )
+
+    for i, (left, right) in enumerate(zip(left_lines, right_lines)):
+        l_num, l_text, l_bg = left
+        r_num, r_text, r_bg = right
+        rows += (
+            f'<tr>'
+            f'<td style="{num_style}background:{l_bg};">{l_num}</td>'
+            f'<td style="{cell_style}background:{l_bg};">{l_text}</td>'
+            f'<td style="{num_style}background:{r_bg};">{r_num}</td>'
+            f'<td style="{cell_style}background:{r_bg};">{r_text}</td>'
+            f'</tr>'
+        )
+
+    return (
+        '<table style="width:100%;border-collapse:collapse;'
+        'table-layout:fixed;">'
+        "<colgroup>"
+        '<col style="width:40px;">'
+        '<col style="width:calc(50% - 40px);">'
+        '<col style="width:40px;">'
+        '<col style="width:calc(50% - 40px);">'
+        "</colgroup>"
+        f"{rows}</table>"
+    )
+
+
+def _is_whitespace_only_diff(entry: dict) -> bool:
+    """Check if a diff entry contains only whitespace changes.
+
+    Compares stripped content of added vs removed lines. If they
+    match after stripping, the change is whitespace-only.
+
+    Args:
+        entry: Diff entry dict with 'diff' key.
+
+    Returns:
+        True if all changes are whitespace-only.
+    """
+    diff_text = entry.get("diff", "")
+    if not diff_text:
+        return False
+
+    added = [
+        line[1:].strip() for line in diff_text.split("\n")
+        if line.startswith("+")
+    ]
+    removed = [
+        line[1:].strip() for line in diff_text.split("\n")
+        if line.startswith("-")
+    ]
+    return added == removed
+
+
 def _render_pr_detail_page(
     group: str, repo_name: str, username: str, pr_number: int,
+    query_string: str = "",
 ) -> str:
     """Render the PR detail page with diff, comments, and review actions.
 
@@ -1370,6 +1567,7 @@ def _render_pr_detail_page(
         repo_name: Repository name.
         username: Authenticated user.
         pr_number: PR number.
+        query_string: Raw query string for options like w=1.
 
     Returns:
         HTML content.
@@ -1507,9 +1705,10 @@ def _render_pr_detail_page(
     </div>"""
 
     # Compute diff between target and source branches
+    ignore_ws = "w=1" in query_string
     diff_html = _compute_pr_diff(
         group, repo_name, pr.target_branch, pr.source_branch,
-        lint_failed_files,
+        lint_failed_files, ignore_whitespace=ignore_ws,
     )
 
     # Settings gear
@@ -1574,11 +1773,27 @@ def _render_pr_detail_page(
     {merge_btn}
 
     <div style="margin-top:2rem;">
-      <h3 style="margin-bottom:1rem;">Files Changed</h3>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+        <h3 style="margin:0;">Files Changed</h3>
+        <label style="display:flex;align-items:center;gap:0.5rem;
+                      font-size:0.875rem;color:#586069;cursor:pointer;">
+          <input type="checkbox" id="ws-toggle"
+                 {"checked" if ignore_ws else ""}
+                 onchange="toggleWhitespace(this.checked)"
+                 style="cursor:pointer;" />
+          Hide whitespace changes
+        </label>
+      </div>
       {diff_html}
     </div>
 
     <script>
+    function toggleWhitespace(hide) {{
+      const url = new URL(window.location);
+      if (hide) {{ url.searchParams.set('w', '1'); }}
+      else {{ url.searchParams.delete('w'); }}
+      window.location = url.toString();
+    }}
     async function submitComment() {{
       const body = document.getElementById('review-body').value;
       const msg = document.getElementById('review-message');
@@ -3110,6 +3325,9 @@ def _get_admin_content(path: str) -> str:
             <a href="/admin/access">Access Control</a>
           </li>
           <li style="padding:0.5rem 0;">
+            <a href="/admin/ai">AI Settings</a>
+          </li>
+          <li style="padding:0.5rem 0;">
             <a href="/admin/audit">Audit Log</a>
           </li>
         </ul>"""
@@ -3119,6 +3337,9 @@ def _get_admin_content(path: str) -> str:
 
     if path == "/admin/access":
         return _render_admin_access_page()
+
+    if path == "/admin/ai":
+        return _render_admin_ai_page()
 
     return f"<h1>Admin</h1><p>Path: {path}</p>"
 
@@ -3504,7 +3725,226 @@ def _handle_auth_callback(request: Request, idp_url: str) -> Response:
     )
 
 
-def _run_pr_linting(
+def _render_admin_ai_page() -> str:
+    """Render the admin AI settings page.
+
+    Shows current Gemini API key status and allows updating it.
+
+    Returns:
+        HTML content for the AI settings page.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+
+    # Check current secret status
+    key_status = "Not configured"
+    key_preview = ""
+    try:
+        sm = boto3.client("secretsmanager")
+        secret = sm.get_secret_value(SecretId="gitgateway/gemini-api-key")
+        api_key = secret.get("SecretString", "")
+        if api_key:
+            key_status = "Configured"
+            key_preview = f"{api_key[:8]}...{api_key[-4:]}"
+    except sm.exceptions.ResourceNotFoundException:
+        key_status = "Not created"
+    except Exception:  # pylint: disable=broad-except
+        key_status = "Error reading secret"
+
+    status_color = "#28a745" if key_status == "Configured" else "#cb2431"
+
+    return f"""
+    <h1>AI Settings</h1>
+    <p>Configure the Gemini API key for AI-powered code reviews and PR summaries.</p>
+
+    <div style="margin:1.5rem 0;padding:1rem;border:1px solid #e1e4e8;
+                border-radius:6px;background:#f6f8fa;">
+      <h3 style="margin:0 0 0.5rem 0;">Gemini API Key</h3>
+      <p style="margin:0.25rem 0;">
+        Status: <span style="color:{status_color};font-weight:600;">
+          {key_status}</span>
+      </p>
+      {"<p style='margin:0.25rem 0;font-family:monospace;color:#586069;'>"
+       + key_preview + "</p>" if key_preview else ""}
+    </div>
+
+    <div style="margin:1.5rem 0;">
+      <h3>Update API Key</h3>
+      <form id="ai-form" style="display:flex;flex-direction:column;gap:0.75rem;
+                                 max-width:500px;">
+        <label for="api-key" style="font-weight:500;">Gemini API Key:</label>
+        <input type="password" id="api-key" name="api_key"
+               placeholder="AIza..."
+               style="padding:0.5rem;border:1px solid #d1d5da;
+                      border-radius:4px;font-family:monospace;" />
+        <button type="submit"
+                style="padding:0.5rem 1rem;background:#2ea44f;color:#fff;
+                       border:none;border-radius:4px;cursor:pointer;
+                       width:fit-content;">
+          Save API Key
+        </button>
+      </form>
+      <div id="ai-message" style="margin-top:0.75rem;"></div>
+    </div>
+
+    <div style="margin:2rem 0;padding:1rem;border:1px solid #e1e4e8;
+                border-radius:6px;">
+      <h3 style="margin:0 0 0.5rem 0;">How it works</h3>
+      <ul style="margin:0;padding-left:1.5rem;color:#586069;">
+        <li>When a PR is created or rescanned, Gemini reviews the code</li>
+        <li>Findings are posted as comments from <code>gitgateway-ai</code></li>
+        <li>A summary of changes is also auto-generated</li>
+        <li>Rate limited to 30 API calls per repo per hour</li>
+      </ul>
+    </div>
+
+    <script>
+    document.getElementById('ai-form').addEventListener('submit', async (e) => {{
+      e.preventDefault();
+      const key = document.getElementById('api-key').value.trim();
+      const msg = document.getElementById('ai-message');
+      if (!key) {{
+        msg.innerHTML = '<span style="color:#cb2431;">Please enter an API key.</span>';
+        return;
+      }}
+      const resp = await fetch('/api/admin/ai-key', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{api_key: key}}),
+      }});
+      if (resp.ok) {{
+        msg.innerHTML = '<span style="color:#28a745;">API key saved successfully.</span>';
+        setTimeout(() => location.reload(), 1500);
+      }} else {{
+        const data = await resp.json();
+        msg.innerHTML = '<span style="color:#cb2431;">' + (data.error || 'Failed to save') + '</span>';
+      }}
+    }});
+    </script>"""
+
+
+def _run_ai_review(
+    group: str, repo_name: str, pr_number: int, source_branch: str,
+) -> None:
+    """Run Gemini AI code review on a PR and post results as a comment.
+
+    Fetches the diff, sends to Gemini for review, and posts findings
+    as a comment from the gitgateway-ai bot user. Also generates a
+    PR summary.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        pr_number: The PR number.
+        source_branch: Source branch of the PR.
+    """
+    import boto3  # pylint: disable=import-outside-toplevel
+    from gitgateway.ai import (  # pylint: disable=import-outside-toplevel
+        AIConfig, AIError, AI_BOT_USER,
+        generate_code_review, generate_pr_summary,
+    )
+    from gitgateway.reviews import add_comment, Comment  # pylint: disable=import-outside-toplevel
+
+    # Load API key from Secrets Manager
+    try:
+        sm = boto3.client("secretsmanager")
+        secret = sm.get_secret_value(SecretId="gitgateway/gemini-api-key")
+        api_key = secret.get("SecretString", "")
+    except Exception as exc:  # pylint: disable=broad-except
+        LOG.warning("Could not load Gemini API key: %s", exc)
+        return
+
+    if not api_key:
+        LOG.info("Gemini API key not configured, skipping AI review")
+        return
+
+    config = AIConfig(api_key=api_key)
+    repo_key = f"{group}/{repo_name}"
+
+    # Get the diff from DynamoDB tree cache
+    table = boto3.resource("dynamodb").Table("gitgateway-repos")
+    response = table.query(
+        KeyConditionExpression=(
+            "PK = :pk AND begins_with(SK, :prefix)"
+        ),
+        ExpressionAttributeValues={
+            ":pk": f"TREE#{group}/{repo_name}#{source_branch}",
+            ":prefix": "FILE#",
+        },
+    )
+    items = response.get("Items", [])
+    if not items:
+        return
+
+    # Build a pseudo-diff from file contents (simplified)
+    diff_lines = []
+    for item in items:
+        path = item.get("path", "")
+        content = item.get("content", "")
+        if path and content and len(content) < 50_000:
+            diff_lines.append(f"--- a/{path}")
+            diff_lines.append(f"+++ b/{path}")
+            for line in content.splitlines()[:100]:
+                diff_lines.append(f"+{line}")
+            diff_lines.append("")
+        if len("\n".join(diff_lines)) > 8000:
+            break
+
+    diff_text = "\n".join(diff_lines)
+    if not diff_text:
+        return
+
+    # Generate code review
+    try:
+        findings = generate_code_review(diff_text, config, repo_key)
+        if findings:
+            review_text = "**AI Code Review** (by Gemini)\n\n"
+            for finding in findings[:20]:
+                sev = finding.get("severity", "info")
+                icon = {"error": "🔴", "warning": "🟡"}.get(sev, "🔵")
+                review_text += (
+                    f"- {icon} `{finding.get('file', '?')}:"
+                    f"{finding.get('line', '?')}` — "
+                    f"{finding.get('message', '')}\n"
+                )
+            if len(findings) > 20:
+                review_text += f"\n... and {len(findings) - 20} more"
+
+            add_comment(Comment(
+                pr_number=pr_number,
+                author=AI_BOT_USER,
+                body=review_text,
+                group=group,
+                repo=repo_name,
+            ))
+        else:
+            add_comment(Comment(
+                pr_number=pr_number,
+                author=AI_BOT_USER,
+                body="**AI Code Review** (by Gemini)\n\n✓ No issues found.",
+                group=group,
+                repo=repo_name,
+            ))
+    except AIError as exc:
+        LOG.warning("AI review failed for PR #%d: %s", pr_number, exc)
+
+    # Generate PR summary
+    try:
+        summary = generate_pr_summary(
+            diff_text, [], config, repo_key,
+        )
+        if summary:
+            add_comment(Comment(
+                pr_number=pr_number,
+                author=AI_BOT_USER,
+                body=f"**AI Summary**\n\n{summary}",
+                group=group,
+                repo=repo_name,
+            ))
+    except AIError as exc:
+        LOG.warning("AI summary failed for PR #%d: %s", pr_number, exc)
+
+
+def _run_pr_linting(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     group: str, repo_name: str, pr_number: int, source_branch: str,
 ) -> None:
     """Run linters on a PR's source branch and post results.
@@ -3520,7 +3960,13 @@ def _run_pr_linting(
     """
     import boto3  # pylint: disable=import-outside-toplevel
     from gitgateway.lint import (  # pylint: disable=import-outside-toplevel
-        _run_pylint, _run_bandit, _run_yamllint, _run_json_check,
+        _run_pylint, _run_bandit, _run_ruff, _run_mypy,
+        _run_yamllint, _run_json_check, _run_toml_check,
+        _run_checkov, _run_cfnlint, _run_tflint, _run_kubeval,
+        _run_shellcheck, _run_hadolint, _run_markdownlint,
+        _run_eslint, _run_sqlfluff,
+        _is_iac_file, _is_cfn_file, _is_k8s_file,
+        _is_shell_file, _is_dockerfile,
     )
     from gitgateway.status_checks import (  # pylint: disable=import-outside-toplevel
         post_status, StatusCheck, CheckStatus,
@@ -3554,13 +4000,8 @@ def _run_pr_linting(
     if not files:
         return
 
-    # Limit total content size to avoid timeout
-    total_size = sum(len(c) for c in files.values())
-    if total_size > 200_000:
-        small_files = {
-            p: c for p, c in files.items() if len(c) < 20_000
-        }
-        files = dict(list(small_files.items())[:20])
+    # Skip very large files (>100KB) to avoid Lambda timeout
+    files = {p: c for p, c in files.items() if len(c) <= 100_000}
 
     if not files:
         return
@@ -3578,65 +4019,110 @@ def _run_pr_linting(
         p: c for p, c in files.items()
         if p.endswith(".json") and c.strip()
     }
+    toml_files = {
+        p: c for p, c in files.items()
+        if p.endswith(".toml") and c.strip()
+    }
+    iac_files = {
+        p: c for p, c in files.items()
+        if _is_iac_file(p, c)
+    }
+    cfn_files = {
+        p: c for p, c in files.items()
+        if _is_cfn_file(p, c)
+    }
+    terraform_files = {
+        p: c for p, c in files.items()
+        if p.endswith(".tf") and c.strip()
+    }
+    k8s_files = {
+        p: c for p, c in files.items()
+        if _is_k8s_file(p, c)
+    }
+    shell_files = {
+        p: c for p, c in files.items()
+        if _is_shell_file(p, c)
+    }
+    docker_files = {
+        p: c for p, c in files.items()
+        if _is_dockerfile(p) and c.strip()
+    }
+    markdown_files = {
+        p: c for p, c in files.items()
+        if p.endswith((".md", ".markdown")) and c.strip()
+    }
+    js_ts_files = {
+        p: c for p, c in files.items()
+        if p.endswith((".js", ".jsx", ".ts", ".tsx")) and c.strip()
+    }
+    sql_files = {
+        p: c for p, c in files.items()
+        if p.endswith(".sql") and c.strip()
+    }
 
     # Run each linter and post individual status checks
     all_findings = []
     linter_results = {}  # name -> (passed, count)
 
-    if python_files:
-        pylint_findings = _run_pylint(python_files)
-        all_findings.extend(pylint_findings)
-        pylint_passed = not any(
-            f.severity == "error" for f in pylint_findings
-        )
-        linter_results["pylint"] = (pylint_passed, len(pylint_findings))
+    # Helper to run a linter, collect findings, post status
+    def _run_and_post(name, func, file_set):
+        findings = func(file_set)
+        all_findings.extend(findings)
+        passed = not any(f.severity == "error" for f in findings)
+        linter_results[name] = (passed, len(findings))
         post_status(StatusCheck(
-            name="lint/pylint",
-            status=CheckStatus.SUCCESS if pylint_passed else CheckStatus.FAILURE,
-            description=f"{len(pylint_findings)} finding(s)",
+            name=f"lint/{name}",
+            status=(
+                CheckStatus.SUCCESS if passed
+                else CheckStatus.FAILURE
+            ),
+            description=f"{len(findings)} finding(s)",
             pr_number=pr_number, group=group, repo=repo_name,
         ))
 
-        bandit_findings = _run_bandit(python_files)
-        all_findings.extend(bandit_findings)
-        bandit_passed = not any(
-            f.severity == "error" for f in bandit_findings
-        )
-        linter_results["bandit"] = (bandit_passed, len(bandit_findings))
-        post_status(StatusCheck(
-            name="lint/bandit",
-            status=CheckStatus.SUCCESS if bandit_passed else CheckStatus.FAILURE,
-            description=f"{len(bandit_findings)} finding(s)",
-            pr_number=pr_number, group=group, repo=repo_name,
-        ))
+    if python_files:
+        _run_and_post("pylint", _run_pylint, python_files)
+        _run_and_post("bandit", _run_bandit, python_files)
+        _run_and_post("ruff", _run_ruff, python_files)
+        _run_and_post("mypy", _run_mypy, python_files)
 
     if yaml_files:
-        yaml_findings = _run_yamllint(yaml_files)
-        all_findings.extend(yaml_findings)
-        yaml_passed = not any(
-            f.severity == "error" for f in yaml_findings
-        )
-        linter_results["yamllint"] = (yaml_passed, len(yaml_findings))
-        post_status(StatusCheck(
-            name="lint/yamllint",
-            status=CheckStatus.SUCCESS if yaml_passed else CheckStatus.FAILURE,
-            description=f"{len(yaml_findings)} finding(s)",
-            pr_number=pr_number, group=group, repo=repo_name,
-        ))
+        _run_and_post("yamllint", _run_yamllint, yaml_files)
 
     if json_files:
-        json_findings = _run_json_check(json_files)
-        all_findings.extend(json_findings)
-        json_passed = not any(
-            f.severity == "error" for f in json_findings
+        _run_and_post("json", _run_json_check, json_files)
+
+    if toml_files:
+        _run_and_post("toml", _run_toml_check, toml_files)
+
+    if iac_files:
+        _run_and_post("checkov", _run_checkov, iac_files)
+
+    if cfn_files:
+        _run_and_post("cfn-lint", _run_cfnlint, cfn_files)
+
+    if terraform_files:
+        _run_and_post("tflint", _run_tflint, terraform_files)
+
+    if k8s_files:
+        _run_and_post("kubeval", _run_kubeval, k8s_files)
+
+    if shell_files:
+        _run_and_post("shellcheck", _run_shellcheck, shell_files)
+
+    if docker_files:
+        _run_and_post("hadolint", _run_hadolint, docker_files)
+
+    if markdown_files:
+        _run_and_post(
+            "markdownlint", _run_markdownlint, markdown_files,
         )
-        linter_results["json"] = (json_passed, len(json_findings))
-        post_status(StatusCheck(
-            name="lint/json",
-            status=CheckStatus.SUCCESS if json_passed else CheckStatus.FAILURE,
-            description=f"{len(json_findings)} finding(s)",
-            pr_number=pr_number, group=group, repo=repo_name,
-        ))
+
+    if js_ts_files:
+        _run_and_post("eslint", _run_eslint, js_ts_files)
+
+    if sql_files:
+        _run_and_post("sqlfluff", _run_sqlfluff, sql_files)
 
     # Post overall status
     overall_passed = all(v[0] for v in linter_results.values())

@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-21
+
 ### Added
+- Lambda layers for dependency management: core layer (dulwich, jinja2, pygments, pyjwt, cryptography, requests, markdown), linting layer (pylint, bandit, yamllint, checkov, cfn-lint, ruff, mypy, sqlfluff), and binary tools layer (shellcheck, hadolint, tflint, kubeconform) deployed as separate Lambda LayerVersions.
+- Checkov IaC scanner integrated into PR linting pipeline for CloudFormation, Terraform, and Kubernetes manifest scanning with per-check status reporting (lint/checkov).
+- cfn-lint integration for CloudFormation template schema validation (lint/cfn-lint).
+- Ruff fast Python linter for complementary checks beyond pylint (lint/ruff).
+- mypy type checker integration for Python files (lint/mypy).
+- TOML syntax validation for pyproject.toml and similar files (lint/toml).
+- tflint integration for Terraform-specific linting (lint/tflint).
+- kubeval/kubeconform integration for Kubernetes manifest schema validation (lint/kubeval).
+- shellcheck integration for shell script analysis (lint/shellcheck).
+- hadolint integration for Dockerfile best practices (lint/hadolint).
+- markdownlint (mdl) integration for Markdown formatting checks (lint/markdownlint).
+- eslint integration for JavaScript/TypeScript linting (lint/eslint).
+- sqlfluff integration for SQL linting (lint/sqlfluff).
+- File categorization helpers: `_is_cfn_file()`, `_is_k8s_file()`, `_is_shell_file()`, `_is_dockerfile()` in lint.py.
+- `_package_layer()` helper in deploy.py for building Lambda layer ZIPs with pip dependencies targeting manylinux2014_x86_64.
+- `_package_binary_layer()` helper that downloads precompiled Linux x86_64 binaries (shellcheck, hadolint, tflint, kubeconform) and packages them into a Lambda layer at /opt/bin.
+- `_install_node_tools()` helper that downloads Node.js 20.x runtime and installs eslint and markdownlint-cli2 via npm into the binary tools layer.
+- `_publish_layer()` helper to publish layer versions via boto3 Lambda API.
+- CloudFormation template parameters `CoreLayerArn`, `LintingLayerArn`, and `BinariesLayerArn` with conditional attachment to the Lambda function.
+
+### Changed
+- Lambda deployment refactored: `package_lambda()` now produces a code-only ZIP (no dependencies), with all runtime deps split into three Lambda layers (core, linting, binaries).
+- `deploy_stack()` now builds and publishes all three layers before deploying the CloudFormation stack.
+- `_run_pr_linting()` refactored to use `_run_and_post()` helper pattern, reducing code duplication across 16 linters.
+- Binary tools (shellcheck, hadolint, tflint, kubeconform, eslint, markdownlint-cli2) now available in Lambda via precompiled layer with embedded Node.js runtime for JS-based tools.
+
 - GitHub-style repository view with Code/Pull Requests tabs, clone URL box, branch selector dropdown, and file tree from DynamoDB cache showing last commit info per file.
 - File viewer with Pygments syntax highlighting, line numbers, copy button, and breadcrumb navigation when clicking files in the repo tree.
 - Repository settings page (admin-only) with default branch override, description editing, and Danger Zone with delete repository button.

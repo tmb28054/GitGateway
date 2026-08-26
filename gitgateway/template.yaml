@@ -32,6 +32,27 @@ Parameters:
     Type: String
     Default: ''
     Description: Identity provider URL for OAuth authentication
+  CoreLayerArn:
+    Type: String
+    Default: ''
+    Description: ARN of the core dependencies Lambda layer
+  LintingLayerArn:
+    Type: String
+    Default: ''
+    Description: ARN of the linting dependencies Lambda layer
+  BinariesLayerArn:
+    Type: String
+    Default: ''
+    Description: ARN of the binary tools Lambda layer
+
+Conditions:
+  HasCoreLayer: !Not [!Equals [!Ref CoreLayerArn, '']]
+  HasLintingLayer: !Not [!Equals [!Ref LintingLayerArn, '']]
+  HasBinariesLayer: !Not [!Equals [!Ref BinariesLayerArn, '']]
+  HasLayers: !Or
+    - !Condition HasCoreLayer
+    - !Condition HasLintingLayer
+    - !Condition HasBinariesLayer
 
 Resources:
   RepoBucket:
@@ -238,6 +259,13 @@ Resources:
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-repos/*'
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-lfs'
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-lfs/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:CreateSecret
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gitgateway/*'
 
   ApiHandler:
     Type: AWS::Lambda::Function
@@ -253,6 +281,12 @@ Resources:
       MemorySize: 512
       EphemeralStorage:
         Size: 10240
+      Layers: !If  # yamllint disable-line rule:line-length
+        - HasLayers
+        - - !If [HasCoreLayer, !Ref CoreLayerArn, !Ref 'AWS::NoValue']
+          - !If [HasLintingLayer, !Ref LintingLayerArn, !Ref 'AWS::NoValue']
+          - !If [HasBinariesLayer, !Ref BinariesLayerArn, !Ref 'AWS::NoValue']
+        - !Ref 'AWS::NoValue'
       Environment:
         Variables:
           STACK_NAME_PREFIX: !Ref StackNamePrefix
