@@ -862,6 +862,37 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
                 headers=headers,
             )
 
+    # POST /api/<group>/<repo>/pulls/<number>/close — close a PR
+    close_match = re.match(
+        r"^/api/([^/]+)/([^/]+)/pulls/(\d+)/close$", path,
+    )
+    if close_match and method == "POST":
+        from gitgateway.pullrequest import (  # pylint: disable=import-outside-toplevel
+            close_pr, PrNotFoundError, InvalidTransitionError,
+        )
+        try:
+            closed = close_pr(
+                close_match.group(1), close_match.group(2),
+                int(close_match.group(3)),
+            )
+            return Response(
+                status_code=200,
+                body=json.dumps(closed.to_dict()),
+                headers=headers,
+            )
+        except PrNotFoundError:
+            return Response(
+                status_code=404,
+                body=json.dumps({"error": "PR not found"}),
+                headers=headers,
+            )
+        except InvalidTransitionError as exc:
+            return Response(
+                status_code=409,
+                body=json.dumps({"error": str(exc)}),
+                headers=headers,
+            )
+
     # POST /api/admin/ai-key — update Gemini API key
     if path == "/api/admin/ai-key" and method == "POST":
         import boto3 as _boto3  # pylint: disable=import-outside-toplevel

@@ -49,6 +49,38 @@ def _get_table(table_suffix: str, dynamodb_resource: object = None) -> Table:
     return dynamodb_resource.Table(table_name)
 
 
+def _delete_all_items_with_pk(table: object, pk_value: str) -> None:
+    """Delete all items in a table with the given partition key.
+
+    Args:
+        table: DynamoDB Table resource.
+        pk_value: The PK value to match.
+    """
+    response = table.query(
+        KeyConditionExpression="PK = :pk",
+        ExpressionAttributeValues={":pk": pk_value},
+        ProjectionExpression="PK, SK",
+    )
+    for item in response.get("Items", []):
+        table.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+
+
+def _delete_items_with_pk_prefix(table: object, pk_prefix: str) -> None:
+    """Delete items whose PK starts with a given prefix via scan.
+
+    Args:
+        table: DynamoDB Table resource.
+        pk_prefix: The PK prefix to match.
+    """
+    response = table.scan(
+        FilterExpression="begins_with(PK, :prefix)",
+        ExpressionAttributeValues={":prefix": pk_prefix},
+        ProjectionExpression="PK, SK",
+    )
+    for item in response.get("Items", []):
+        table.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+
+
 # --- Group Operations ---
 
 
@@ -257,7 +289,9 @@ def delete_repo(
     name: str,
     dynamodb_resource: object = None,
 ) -> None:
-    """Delete a repository.
+    """Delete a repository and all associated data.
+
+    Removes the repo entry, all PRs, comments, and status checks.
 
     Args:
         group: The group name.
@@ -273,7 +307,24 @@ def delete_repo(
     table.delete_item(
         Key={"PK": f"GROUP#{group}", "SK": f"REPO#{name}"},
     )
-    LOG.info("Deleted repo: %s/%s", group, name)
+
+    # Clean up PRs
+    prs_table = _get_table("prs", dynamodb_resource)
+    pr_pk = f"REPO#{group}/{name}"
+    _delete_all_items_with_pk(prs_table, pr_pk)
+
+    # Clean up comments
+    comments_table = _get_table("comments", dynamodb_resource)
+    _delete_all_items_with_pk(comments_table, pr_pk)
+
+    # Clean up status checks
+    checks_table = _get_table("status-checks", dynamodb_resource)
+    _delete_items_with_pk_prefix(checks_table, f"PR#{group}/{name}")
+
+    # Clean up tree cache entries
+    _delete_items_with_pk_prefix(table, f"TREE#{group}/{name}")
+
+    LOG.info("Deleted repo and associated data: %s/%s", group, name)
 
 
 def update_repo(

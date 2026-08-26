@@ -235,6 +235,15 @@ class TestFullGitWorkflow:
             assert pr_data["number"] == 1
             assert pr_data["title"] == "Merge test-branch into main"
 
+            # --- Step 10b: Close the pull request ---
+            close_resp = requests.post(
+                f"{BASE_URL}/api/{test_group}/{repo_name}/pulls/1/close",
+                timeout=10,
+            )
+            assert close_resp.status_code == 200, (
+                f"PR close failed: {close_resp.status_code} {close_resp.text}"
+            )
+
             # --- Step 11: Delete the repository ---
             del_resp = requests.delete(
                 f"{BASE_URL}/api/repos/{test_group}/{repo_name}",
