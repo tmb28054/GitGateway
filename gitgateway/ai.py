@@ -17,7 +17,7 @@ import requests
 LOG = logging.getLogger(__name__)
 
 AI_BOT_USER = "gitgateway-ai"
-DEFAULT_MODEL = "gemini-pro"
+DEFAULT_MODEL = "gemini-3.6-flash"
 DEFAULT_MAX_CALLS_PER_HOUR = 30
 
 
