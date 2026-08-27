@@ -327,6 +327,14 @@ def _dispatch(handler_name: str, request: Request) -> Response:
             repo_name=repo_name,
             content_type=request.headers.get("content-type", ""),
         )
+
+        # After successful push, re-run linting on any open PRs for this branch
+        if is_push and status == 200:
+            try:
+                _trigger_post_push_linting(group, repo_name)
+            except Exception:  # pylint: disable=broad-except
+                pass  # Non-critical — don't fail the push
+
         return Response(
             status_code=status,
             body=resp_body,
@@ -4392,6 +4400,63 @@ def _run_ai_review(
             ))
     except AIError as exc:
         LOG.warning("AI summary failed for PR #%d: %s", pr_number, exc)
+
+
+def _trigger_post_push_linting(group: str, repo_name: str) -> None:
+    """Find open PRs for this repo and re-run linting asynchronously.
+
+    Called after a successful git push. Invokes the Lambda function
+    asynchronously to re-scan open PRs without blocking the push.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+    """
+    import boto3 as _boto3  # pylint: disable=import-outside-toplevel
+
+    # Find open PRs
+    from gitgateway.pullrequest import list_prs, PrStatus  # pylint: disable=import-outside-toplevel
+
+    try:
+        prs = list_prs(group, repo_name)
+        open_prs = [pr for pr in prs if pr.status == PrStatus.OPEN]
+        if not open_prs:
+            return
+
+        # Invoke rescan asynchronously for each open PR
+        lambda_client = _boto3.client("lambda")
+        import os  # pylint: disable=import-outside-toplevel
+        func_name = os.environ.get(
+            "AWS_LAMBDA_FUNCTION_NAME", "gitgateway-handler",
+        )
+
+        for pr in open_prs:
+            payload = json.dumps({
+                "requestContext": {"http": {
+                    "method": "POST",
+                    "path": (
+                        f"/api/{group}/{repo_name}"
+                        f"/pulls/{pr.number}/rescan"
+                    ),
+                }},
+                "rawPath": (
+                    f"/api/{group}/{repo_name}"
+                    f"/pulls/{pr.number}/rescan"
+                ),
+                "headers": {"cookie": ""},
+                "body": "",
+                "isBase64Encoded": False,
+            })
+            lambda_client.invoke(
+                FunctionName=func_name,
+                InvocationType="Event",  # Async — fire and forget
+                Payload=payload,
+            )
+            LOG.info(
+                "Triggered async rescan for PR #%d", pr.number,
+            )
+    except Exception as exc:  # pylint: disable=broad-except
+        LOG.warning("Post-push linting trigger failed: %s", exc)
 
 
 def _run_pr_linting(  # pylint: disable=too-many-locals,too-many-branches,too-many-statements
