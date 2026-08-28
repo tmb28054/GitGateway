@@ -176,14 +176,19 @@ def generate_pr_summary(
     commits_text = "\n".join(f"- {msg}" for msg in commit_messages)
 
     prompt = (
-        "You are a code review assistant. Generate a concise summary "
-        "of this pull request based on the diff and commit messages.\n\n"
+        "You are a senior software engineer reviewing a pull request. "
+        "Your job is to provide actionable feedback that improves the "
+        "code quality, maintainability, and correctness.\n\n"
         "Commit messages:\n"
         f"{commits_text}\n\n"
         "Diff:\n"
         f"{diff_text[:8000]}\n\n"
-        "Provide a brief summary of what changed and why, "
-        "in 2-4 sentences."
+        "Write a summary that covers:\n"
+        "1. What this PR accomplishes (1-2 sentences)\n"
+        "2. Potential risks or concerns with the approach (if any)\n"
+        "3. One concrete suggestion for improvement\n\n"
+        "Be direct and specific. Don't just describe what changed — "
+        "explain whether the approach is sound and what could be better."
     )
 
     return call_gemini(prompt, config, repo_key)
@@ -209,16 +214,29 @@ def generate_code_review(
         AIError: If the API call fails.
     """
     prompt = (
-        "You are a code review assistant. Review this diff for "
-        "potential bugs, security issues, and style problems.\n\n"
+        "You are a senior software engineer performing a code review. "
+        "Focus on providing actionable suggestions that improve the code. "
+        "Don't just point out what exists — suggest HOW to make it better.\n\n"
+        "Review priorities (in order):\n"
+        "1. Bugs or logic errors that would cause incorrect behavior\n"
+        "2. Security vulnerabilities (injection, auth bypass, data exposure)\n"
+        "3. Performance issues (N+1 queries, unnecessary allocations, missing caching)\n"
+        "4. Maintainability (unclear naming, missing error handling, tight coupling)\n"
+        "5. Improvements (better algorithms, simpler approaches, missing edge cases)\n\n"
+        "For each finding, explain:\n"
+        "- WHAT is wrong or could be better\n"
+        "- WHY it matters\n"
+        "- HOW to fix it (concrete suggestion)\n\n"
         "Diff:\n"
         f"{diff_text[:8000]}\n\n"
         "Return your findings as a JSON array where each item has:\n"
         '- "file": the filename\n'
         '- "line": the approximate line number\n'
-        '- "message": the issue description\n'
-        '- "severity": one of "info", "warning", "error"\n\n'
-        "If no issues found, return an empty array: []\n"
+        '- "message": what to improve and how (be specific and actionable)\n'
+        '- "severity": "error" for bugs/security, "warning" for performance/'
+        'maintainability, "info" for style/improvements\n\n'
+        "If the code looks good, still suggest at least one improvement. "
+        "Good code can always be made better.\n"
         "Return ONLY the JSON array, no other text."
     )
 
