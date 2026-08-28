@@ -1303,17 +1303,7 @@ def _get_page_content(path: str, user_info: dict, query_string: str = "") -> str
     username = user_info.get("username", "")
 
     if path == "/" or path == "":
-        return f"""
-        <h1>Welcome, {username}</h1>
-        <p>Your serverless Git hosting platform.</p>
-        <div style="margin-top:2rem;">
-          <h2>Quick Actions</h2>
-          <ul style="list-style:none;padding:0;margin-top:1rem;">
-            <li style="padding:0.5rem 0;">
-              <a href="/groups">View Groups</a>
-            </li>
-          </ul>
-        </div>"""
+        return _render_dashboard(username)
 
     if path == "/groups":
         return _render_user_groups_page(username)
@@ -3996,6 +3986,148 @@ def _handle_auth_callback(request: Request, idp_url: str) -> Response:
             ),
         },
     )
+
+
+def _render_dashboard(username: str) -> str:
+    """Render the landing page dashboard.
+
+    Shows open PRs awaiting the user's review and recently
+    active repositories.
+
+    Args:
+        username: Authenticated user.
+
+    Returns:
+        HTML content.
+    """
+    import boto3 as _boto3  # pylint: disable=import-outside-toplevel
+
+    ddb = _boto3.resource("dynamodb")
+
+    # --- Open PRs awaiting review ---
+    prs_table = ddb.Table("gitgateway-prs")
+    pr_response = prs_table.scan(
+        FilterExpression="attribute_exists(#s) AND #s = :open",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":open": "open"},
+    )
+    open_prs = pr_response.get("Items", [])
+
+    # Filter to PRs where the user is NOT the author (awaiting their review)
+    review_prs = [
+        pr for pr in open_prs
+        if pr.get("author", "") != username
+    ]
+
+    pr_rows = ""
+    for pr in sorted(review_prs, key=lambda x: x.get("created_at", ""), reverse=True)[:10]:
+        repo_key = pr.get("PK", "").replace("REPO#", "")
+        parts = repo_key.split("/", 1)
+        if len(parts) != 2:
+            continue
+        group, repo_name = parts
+        pr_num = pr.get("number", 0)
+        title = pr.get("title", "Untitled")
+        author = pr.get("author", "unknown")
+        source = pr.get("source_branch", "?")
+        target = pr.get("target_branch", "?")
+
+        pr_rows += f"""
+        <tr style="border-bottom:1px solid #f0f0f0;cursor:pointer;"
+          onclick="window.location='/groups/{group}/{repo_name}/pulls/{pr_num}'">
+          <td style="padding:0.6rem 0.75rem;">
+            <strong>{title}</strong>
+            <span style="color:#586069;"> #{pr_num}</span>
+            <div style="color:#586069;font-size:0.8rem;margin-top:0.15rem;">
+              {group}/{repo_name} · {author} ·
+              <code>{source}</code> → <code>{target}</code>
+            </div>
+          </td>
+        </tr>"""
+
+    if not pr_rows:
+        pr_rows = """
+        <tr><td style="padding:1.5rem;color:#586069;text-align:center;">
+          No pull requests awaiting your review.
+        </td></tr>"""
+
+    # --- Recently active repositories ---
+    repos_table = ddb.Table("gitgateway-repos")
+    # Scan for repos that have tree cache entries (indicates recent pushes)
+    repos_response = repos_table.scan(
+        FilterExpression="begins_with(PK, :prefix) AND begins_with(SK, :repo)",
+        ExpressionAttributeValues={
+            ":prefix": "GROUP#",
+            ":repo": "REPO#",
+        },
+    )
+    all_repos = repos_response.get("Items", [])
+
+    # Sort by last_push or updated_at if available
+    for repo in all_repos:
+        repo["_sort_key"] = (
+            repo.get("last_push", "")
+            or repo.get("updated_at", "")
+            or repo.get("created_at", "")
+        )
+
+    recent_repos = sorted(
+        all_repos,
+        key=lambda x: x.get("_sort_key", ""),
+        reverse=True,
+    )[:8]
+
+    repo_cards = ""
+    for repo in recent_repos:
+        group = repo.get("PK", "").replace("GROUP#", "")
+        name = repo.get("SK", "").replace("REPO#", "")
+        desc = repo.get("description", "")
+        last_activity = repo.get("_sort_key", "")[:10] or ""
+
+        repo_cards += f"""
+        <a href="/groups/{group}/{name}" style="text-decoration:none;color:inherit;">
+          <div style="border:1px solid #e1e4e8;border-radius:6px;
+            padding:1rem;background:#fff;">
+            <div style="font-weight:600;color:#0366d6;">
+              {group}/{name}
+            </div>
+            <div style="color:#586069;font-size:0.85rem;
+              margin-top:0.3rem;">{desc or 'No description'}</div>
+            <div style="color:#959da5;font-size:0.75rem;
+              margin-top:0.5rem;">
+              {"Updated " + last_activity if last_activity else ""}
+            </div>
+          </div>
+        </a>"""
+
+    if not repo_cards:
+        repo_cards = """
+        <p style="color:#586069;">No repositories found.
+          <a href="/groups">Create one</a>.</p>"""
+
+    return f"""
+    <h1 style="margin-bottom:1.5rem;">Welcome, {username}</h1>
+
+    <div style="margin-bottom:2.5rem;">
+      <h2 style="margin-bottom:0.75rem;font-size:1.2rem;">
+        Pull Requests Awaiting Review
+      </h2>
+      <table style="width:100%;border-collapse:collapse;
+        border:1px solid #e1e4e8;border-radius:6px;">
+        <tbody>
+          {pr_rows}
+        </tbody>
+      </table>
+    </div>
+
+    <div>
+      <h2 style="margin-bottom:0.75rem;font-size:1.2rem;">
+        Recently Active Repositories
+      </h2>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));gap:1rem;">
+        {repo_cards}
+      </div>
+    </div>"""
 
 
 def _render_tokens_page(username: str) -> str:
