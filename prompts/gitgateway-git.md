@@ -81,6 +81,30 @@ When a PR is opened (or its source branch is pushed), GitGateway automatically:
 
 Results appear on the PR detail page. Push fixes to the source branch to re-trigger.
 
+## Git LFS (Large File Storage)
+
+GitGateway supports Git LFS with S3-backed storage via presigned URLs.
+
+```bash
+# Install git-lfs
+git lfs install
+
+# Track large file types
+git lfs track "*.psd" "*.zip" "*.bin"
+git add .gitattributes && git commit -m "Configure LFS"
+
+# LFS uses the same token auth as git — no extra config needed.
+# The LFS endpoint is auto-discovered from the repo URL:
+#   https://git.botthouse.net/group/repo.git/info/lfs
+```
+
+Behind the scenes:
+- `objects/batch` returns presigned S3 PUT (upload) / GET (download) URLs
+- Objects stored content-addressably at `lfs/{group}/{repo}/{oid[:2]}/{oid[2:4]}/{oid}`
+- Presigned URLs expire after 1 hour
+- Upload requires a `read/write` token; download works with `read`
+- File locking supported (`git lfs lock`, `git lfs unlock`, `git lfs locks`)
+
 ## Notes
 
 - Pushing to a repo you have `read` scope on returns `403 Forbidden`.

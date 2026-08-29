@@ -342,11 +342,7 @@ def _dispatch(handler_name: str, request: Request) -> Response:
         )
 
     if handler_name == "lfs":
-        return Response(
-            status_code=200,
-            body=json.dumps({"handler": "lfs", "path": request.path}),
-            headers={"Content-Type": "application/vnd.git-lfs+json"},
-        )
+        return _handle_lfs(request)
 
     if handler_name == "auth":
         return _handle_auth_callback(request, idp_url)
@@ -1689,6 +1685,178 @@ def _get_request_username(request: Request) -> str:
         return user_info.get("username", "")
     except Exception:  # pylint: disable=broad-except
         return ""
+
+
+def _handle_lfs(request: Request) -> Response:
+    """Handle Git LFS Batch API and Lock API requests.
+
+    Requires authentication (same token/JWT as git operations).
+    Routes to batch (presigned S3 URLs) or lock endpoints.
+
+    Args:
+        request: The HTTP request.
+
+    Returns:
+        Response with LFS JSON body.
+
+    Raises:
+        None — errors are returned as LFS error responses.
+    """
+    import re as _re  # pylint: disable=import-outside-toplevel
+    from gitgateway.lfs import (  # pylint: disable=import-outside-toplevel
+        handle_batch_request, create_lock, list_locks,
+        verify_locks, delete_lock, LfsError,
+    )
+
+    lfs_headers = {"Content-Type": "application/vnd.git-lfs+json"}
+
+    # Authenticate
+    git_user = _authenticate_git_request(request)
+    if git_user is None:
+        return Response(
+            status_code=401,
+            body=json.dumps({"message": "Authentication required"}),
+            headers={
+                **lfs_headers,
+                "WWW-Authenticate": 'Basic realm="GitGateway"',
+            },
+        )
+
+    # Parse group/repo from path
+    match = _re.match(
+        r"^/([^/]+)/([^/]+)\.git/info/lfs/(.*)", request.path,
+    )
+    if not match:
+        return Response(
+            status_code=400,
+            body=json.dumps({"message": "Invalid LFS URL"}),
+            headers=lfs_headers,
+        )
+
+    group = match.group(1)
+    repo_name = match.group(2)
+    lfs_path = match.group(3)
+    username = git_user.get("username", "")
+
+    try:
+        body = json.loads(request.body.decode()) if request.body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = {}
+
+    # POST /objects/batch — presigned URLs for upload/download
+    if lfs_path == "objects/batch" and request.method == "POST":
+        operation = body.get("operation", "download")
+        # Push (upload) requires read/write scope
+        if operation == "upload" and git_user.get("scope") == "read":
+            return Response(
+                status_code=403,
+                body=json.dumps({
+                    "message": "Token is read-only; upload requires read/write",
+                }),
+                headers=lfs_headers,
+            )
+        try:
+            result = handle_batch_request(
+                group=group,
+                repo=repo_name,
+                operation=operation,
+                objects=body.get("objects", []),
+            )
+            return Response(
+                status_code=200,
+                body=json.dumps(result),
+                headers=lfs_headers,
+            )
+        except LfsError as exc:
+            return Response(
+                status_code=exc.status_code,
+                body=json.dumps({"message": str(exc)}),
+                headers=lfs_headers,
+            )
+
+    # POST /locks — create a lock
+    if lfs_path == "locks" and request.method == "POST":
+        if git_user.get("scope") == "read":
+            return Response(
+                status_code=403,
+                body=json.dumps({
+                    "message": "Token is read-only; locking requires read/write",
+                }),
+                headers=lfs_headers,
+            )
+        try:
+            lock = create_lock(
+                group, repo_name, body.get("path", ""), username,
+            )
+            return Response(
+                status_code=201,
+                body=json.dumps({"lock": lock.to_dict()}),
+                headers=lfs_headers,
+            )
+        except LfsError as exc:
+            return Response(
+                status_code=exc.status_code,
+                body=json.dumps({"message": str(exc)}),
+                headers=lfs_headers,
+            )
+
+    # GET /locks — list locks
+    if lfs_path == "locks" and request.method == "GET":
+        locks = list_locks(group, repo_name)
+        return Response(
+            status_code=200,
+            body=json.dumps({
+                "locks": [lock.to_dict() for lock in locks],
+            }),
+            headers=lfs_headers,
+        )
+
+    # POST /locks/verify — verify locks
+    if lfs_path == "locks/verify" and request.method == "POST":
+        ours, theirs = verify_locks(group, repo_name, username)
+        return Response(
+            status_code=200,
+            body=json.dumps({
+                "ours": [lock.to_dict() for lock in ours],
+                "theirs": [lock.to_dict() for lock in theirs],
+            }),
+            headers=lfs_headers,
+        )
+
+    # POST /locks/{id}/unlock — delete a lock
+    unlock_match = _re.match(r"^locks/([^/]+)/unlock$", lfs_path)
+    if unlock_match and request.method == "POST":
+        if git_user.get("scope") == "read":
+            return Response(
+                status_code=403,
+                body=json.dumps({
+                    "message": "Token is read-only",
+                }),
+                headers=lfs_headers,
+            )
+        lock_id = unlock_match.group(1)
+        force = bool(body.get("force", False))
+        try:
+            lock = delete_lock(
+                group, repo_name, lock_id, username, force=force,
+            )
+            return Response(
+                status_code=200,
+                body=json.dumps({"lock": lock.to_dict()}),
+                headers=lfs_headers,
+            )
+        except LfsError as exc:
+            return Response(
+                status_code=exc.status_code,
+                body=json.dumps({"message": str(exc)}),
+                headers=lfs_headers,
+            )
+
+    return Response(
+        status_code=404,
+        body=json.dumps({"message": "LFS endpoint not found"}),
+        headers=lfs_headers,
+    )
 
 
 def _authenticate_git_request(request: Request) -> dict | None:
