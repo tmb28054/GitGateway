@@ -295,7 +295,7 @@ def fork_repo(  # pylint: disable=too-many-positional-arguments
 # --- Private helpers ---
 
 
-def _sync_local_to_s3(
+def _sync_local_to_s3(  # pylint: disable=too-many-locals
     local_path: Path,
     group: str,
     repo: str,
@@ -313,12 +313,29 @@ def _sync_local_to_s3(
     """
     prefix = _repo_s3_prefix(group, repo)
 
+    # Upload all local files and track which keys should exist
+    local_keys = set()
     for root, _dirs, files in os.walk(local_path):
         for filename in files:
             file_path = Path(root) / filename
             relative = file_path.relative_to(local_path)
             s3_key = f"{prefix}{relative}"
             client.upload_file(str(file_path), bucket, s3_key)
+            local_keys.add(s3_key)
+
+    # Delete S3 objects that no longer exist locally (e.g. deleted
+    # branch refs). This makes S3 mirror the local repo state so
+    # deletions actually persist.
+    existing_keys = set(_list_s3_objects(bucket, prefix, client))
+    stale_keys = existing_keys - local_keys
+    if stale_keys:
+        stale_list = list(stale_keys)
+        for i in range(0, len(stale_list), 1000):
+            batch = stale_list[i:i + 1000]
+            client.delete_objects(
+                Bucket=bucket,
+                Delete={"Objects": [{"Key": k} for k in batch]},
+            )
 
 
 def _list_s3_objects(
