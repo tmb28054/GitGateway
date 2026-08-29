@@ -1225,6 +1225,12 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
     # Route to the right page content
     page_content = _get_page_content(request.path, user_info, request.query_string)
 
+    # Build the left sidebar (accessible groups + repos)
+    try:
+        sidebar = _render_sidebar(username)
+    except Exception:  # pylint: disable=broad-except
+        sidebar = ""
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1236,7 +1242,15 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI',
       Roboto, sans-serif; line-height: 1.6; color: #24292e;
       background: #fff; transition: background 0.3s, color 0.3s; }}
-    main {{ max-width: 1000px; margin: 2rem auto; padding: 0 1.5rem; }}
+    .layout {{ display: flex; align-items: flex-start; }}
+    main {{ flex: 1; max-width: 1000px; margin: 2rem auto; padding: 0 1.5rem; }}
+    #sidebar a:hover {{ text-decoration: underline; }}
+    @media (max-width: 700px) {{
+      .layout {{ flex-direction: column; }}
+      #sidebar {{ width: 100% !important; min-height: auto !important;
+        border-right: none !important;
+        border-bottom: 1px solid #e1e4e8; }}
+    }}
     h1 {{ margin-bottom: 1rem; }}
     a {{ color: #0366d6; text-decoration: none; }}
     a:hover {{ text-decoration: underline; }}
@@ -1255,13 +1269,20 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
     body.dark div[style*="background:#f6f8fa"],
     body.dark div[style*="background: #f6f8fa"] {{
       background: #161b22 !important; }}
+    body.dark #sidebar {{ background: #161b22 !important;
+      border-color: #30363d !important; }}
+    body.dark aside[style*="background:#fafbfc"] {{
+      background: #161b22 !important; }}
   </style>
 </head>
 <body>
   {nav_bar}
-  <main>
-    {page_content}
-  </main>
+  <div class="layout">
+    {sidebar}
+    <main>
+      {page_content}
+    </main>
+  </div>
   <script>
   function toggleDarkMode() {{
     document.body.classList.toggle('dark');
@@ -1421,6 +1442,117 @@ def _get_page_content(path: str, user_info: dict, query_string: str = "") -> str
         return _get_admin_content(path)
 
     return f"<h1>Page</h1><p>Path: {path}</p>"
+
+
+def _render_sidebar(username: str) -> str:
+    """Render the left sidebar navigation listing accessible groups and repos.
+
+    Args:
+        username: The authenticated username.
+
+    Returns:
+        HTML for the sidebar.
+    """
+    from gitgateway.db import (  # pylint: disable=import-outside-toplevel
+        list_user_access, list_groups, list_repos,
+    )
+
+    try:
+        access_entries = list_user_access(username)
+    except Exception:  # pylint: disable=broad-except
+        access_entries = []
+
+    # Groups the user can see (group-level access)
+    group_names = {
+        entry.resource for entry in access_entries
+        if not entry.is_repo_level
+    }
+    # Repos the user can see via repo-level access
+    repo_resources = {
+        entry.resource for entry in access_entries
+        if entry.is_repo_level
+    }
+
+    try:
+        all_groups = list_groups()
+    except Exception:  # pylint: disable=broad-except
+        all_groups = []
+    visible_groups = [g for g in all_groups if g.name in group_names]
+
+    items = ""
+    for group in sorted(visible_groups, key=lambda g: g.name):
+        # List repos in this group
+        try:
+            repos = list_repos(group.name)
+        except Exception:  # pylint: disable=broad-except
+            repos = []
+
+        repo_links = ""
+        for repo in sorted(repos, key=lambda r: r.name):
+            repo_links += f"""
+            <li style="padding:0.15rem 0 0.15rem 1rem;">
+              <a href="/groups/{group.name}/{repo.name}"
+                style="font-size:0.85rem;color:#586069;">
+                {repo.name}</a>
+            </li>"""
+
+        if not repo_links:
+            repo_links = (
+                '<li style="padding:0.15rem 0 0.15rem 1rem;'
+                'color:#959da5;font-size:0.8rem;">No repositories</li>'
+            )
+
+        items += f"""
+        <li style="margin-bottom:0.75rem;">
+          <a href="/groups/{group.name}"
+            style="font-weight:600;font-size:0.9rem;">
+            {group.name}</a>
+          <ul style="list-style:none;margin-top:0.25rem;">
+            {repo_links}
+          </ul>
+        </li>"""
+
+    # Repos accessible via repo-level grants (not in a visible group)
+    orphan_repos = ""
+    for resource in sorted(repo_resources):
+        parts = resource.split("/", 1)
+        if len(parts) == 2 and parts[0] not in group_names:
+            orphan_repos += f"""
+            <li style="padding:0.15rem 0;">
+              <a href="/groups/{parts[0]}/{parts[1]}"
+                style="font-size:0.85rem;">{resource}</a>
+            </li>"""
+
+    orphan_section = ""
+    if orphan_repos:
+        orphan_section = f"""
+        <li style="margin-top:0.75rem;">
+          <span style="font-weight:600;font-size:0.9rem;
+            color:#586069;">Shared Repos</span>
+          <ul style="list-style:none;margin-top:0.25rem;">
+            {orphan_repos}
+          </ul>
+        </li>"""
+
+    if not items and not orphan_section:
+        items = (
+            '<li style="color:#959da5;font-size:0.85rem;">'
+            'No accessible groups or repos.</li>'
+        )
+
+    return f"""
+    <aside id="sidebar" style="width:240px;flex-shrink:0;
+      border-right:1px solid #e1e4e8;padding:1.5rem 1rem;
+      background:#fafbfc;min-height:calc(100vh - 52px);">
+      <div style="font-size:0.75rem;text-transform:uppercase;
+        letter-spacing:0.05em;color:#959da5;margin-bottom:0.75rem;">
+        Groups &amp; Repositories
+      </div>
+      <ul style="list-style:none;">
+        {items}
+        {orphan_section}
+      </ul>
+    </aside>"""
 
 
 def _render_user_groups_page(username: str) -> str:
