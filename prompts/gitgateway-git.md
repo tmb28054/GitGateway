@@ -85,14 +85,40 @@ Results appear on the PR detail page. Push fixes to the source branch to re-trig
 
 GitGateway supports Git LFS with S3-backed storage via presigned URLs.
 
-```bash
-# Install git-lfs
-git lfs install
+### One-time setup (per machine)
 
-# Track large file types
+`git-lfs` is a separate binary from git. Install it first:
+
+```bash
+# macOS
+brew install git-lfs
+# Debian/Ubuntu
+sudo apt-get install git-lfs
+# or download from https://git-lfs.com
+
+# Verify it's available
+git lfs version
+
+# Register the git hooks/filters (once per machine/user)
+git lfs install
+```
+
+If you see `git: 'lfs' is not a git command`, the binary isn't installed yet
+— run the install step above.
+
+### Per-repo setup
+
+```bash
+# Track large file types (writes to .gitattributes)
 git lfs track "*.psd" "*.zip" "*.bin"
 git add .gitattributes && git commit -m "Configure LFS"
+```
 
+`.gitattributes` is committed and travels with the repo. Anyone who clones it
+gets the LFS config automatically — they only need `git lfs install` done once
+on their machine.
+
+```bash
 # LFS uses the same token auth as git — no extra config needed.
 # The LFS endpoint is auto-discovered from the repo URL:
 #   https://git.botthouse.net/group/repo.git/info/lfs
