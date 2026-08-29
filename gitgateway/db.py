@@ -155,11 +155,21 @@ def list_groups(dynamodb_resource: object = None) -> list[Group]:
         List of all groups.
     """
     table = _get_table("repos", dynamodb_resource)
-    response = table.scan(
-        FilterExpression="SK = :sk",
-        ExpressionAttributeValues={":sk": "METADATA"},
-    )
-    items = response.get("Items", [])
+    items = []
+    scan_kwargs = {
+        "FilterExpression": "#sk = :sk",
+        "ExpressionAttributeNames": {"#sk": "SK"},
+        "ExpressionAttributeValues": {":sk": "METADATA"},
+    }
+    # Paginate: the repos table also holds tree-cache entries, so
+    # metadata items may span multiple scan pages.
+    while True:
+        response = table.scan(**scan_kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        scan_kwargs["ExclusiveStartKey"] = last_key
     return [Group.from_dict(item) for item in items]
 
 
@@ -265,22 +275,36 @@ def list_repos(
         List of repositories.
     """
     table = _get_table("repos", dynamodb_resource)
+    items = []
     if group:
-        response = table.query(
-            KeyConditionExpression=(
+        query_kwargs = {
+            "KeyConditionExpression": (
                 "PK = :pk AND begins_with(SK, :sk_prefix)"
             ),
-            ExpressionAttributeValues={
+            "ExpressionAttributeValues": {
                 ":pk": f"GROUP#{group}",
                 ":sk_prefix": "REPO#",
             },
-        )
+        }
+        while True:
+            response = table.query(**query_kwargs)
+            items.extend(response.get("Items", []))
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_key
     else:
-        response = table.scan(
-            FilterExpression="begins_with(SK, :sk_prefix)",
-            ExpressionAttributeValues={":sk_prefix": "REPO#"},
-        )
-    items = response.get("Items", [])
+        scan_kwargs = {
+            "FilterExpression": "begins_with(SK, :sk_prefix)",
+            "ExpressionAttributeValues": {":sk_prefix": "REPO#"},
+        }
+        while True:
+            response = table.scan(**scan_kwargs)
+            items.extend(response.get("Items", []))
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            scan_kwargs["ExclusiveStartKey"] = last_key
     return [Repo.from_dict(item) for item in items]
 
 
@@ -308,21 +332,31 @@ def delete_repo(
         Key={"PK": f"GROUP#{group}", "SK": f"REPO#{name}"},
     )
 
-    # Clean up PRs
-    prs_table = _get_table("prs", dynamodb_resource)
+    # Clean up associated data (best effort — tables may not all exist)
     pr_pk = f"REPO#{group}/{name}"
-    _delete_all_items_with_pk(prs_table, pr_pk)
-
-    # Clean up comments
-    comments_table = _get_table("comments", dynamodb_resource)
-    _delete_all_items_with_pk(comments_table, pr_pk)
-
-    # Clean up status checks
-    checks_table = _get_table("status-checks", dynamodb_resource)
-    _delete_items_with_pk_prefix(checks_table, f"PR#{group}/{name}")
-
-    # Clean up tree cache entries
-    _delete_items_with_pk_prefix(table, f"TREE#{group}/{name}")
+    try:
+        _delete_all_items_with_pk(
+            _get_table("prs", dynamodb_resource), pr_pk,
+        )
+    except Exception:  # pylint: disable=broad-except
+        pass
+    try:
+        _delete_all_items_with_pk(
+            _get_table("comments", dynamodb_resource), pr_pk,
+        )
+    except Exception:  # pylint: disable=broad-except
+        pass
+    try:
+        _delete_items_with_pk_prefix(
+            _get_table("status-checks", dynamodb_resource),
+            f"PR#{group}/{name}",
+        )
+    except Exception:  # pylint: disable=broad-except
+        pass
+    try:
+        _delete_items_with_pk_prefix(table, f"TREE#{group}/{name}")
+    except Exception:  # pylint: disable=broad-except
+        pass
 
     LOG.info("Deleted repo and associated data: %s/%s", group, name)
 

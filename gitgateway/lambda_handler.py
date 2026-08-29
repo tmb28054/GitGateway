@@ -1459,7 +1459,8 @@ def _render_sidebar(username: str) -> str:
 
     try:
         access_entries = list_user_access(username)
-    except Exception:  # pylint: disable=broad-except
+    except Exception as exc:  # pylint: disable=broad-except
+        LOG.warning("Sidebar access lookup failed for %s: %s", username, exc)
         access_entries = []
 
     # Groups the user can see (group-level access)
