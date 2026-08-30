@@ -158,7 +158,11 @@ def _lfs_s3_key(group: str, repo: str, oid: str) -> str:
 
 
 def _get_s3_client(s3_client: object = None) -> object:
-    """Get an S3 client.
+    """Get an S3 client configured for SigV4 presigned URLs.
+
+    The LFS bucket uses KMS encryption, which requires AWS Signature
+    Version 4 for presigned URLs. Force SigV4 and virtual-host
+    addressing so presigned PUT/GET URLs are accepted by S3.
 
     Args:
         s3_client: Optional boto3 S3 client for testing.
@@ -167,7 +171,14 @@ def _get_s3_client(s3_client: object = None) -> object:
         A boto3 S3 client.
     """
     if s3_client is None:
-        return boto3.client("s3")
+        from botocore.config import Config  # pylint: disable=import-outside-toplevel
+        return boto3.client(
+            "s3",
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "virtual"},
+            ),
+        )
     return s3_client
 
 
