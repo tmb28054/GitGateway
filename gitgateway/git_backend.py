@@ -274,6 +274,19 @@ def _handle_upload_pack(
             except KeyError:
                 continue
 
+        # Deduplicate objects by SHA — the same object can be reached
+        # from multiple wants or re-added while walking, and a pack must
+        # not contain the same object twice.
+        seen_shas: set[bytes] = set()
+        unique_objects = []
+        for obj in objects_to_send:
+            sha = obj.id
+            if sha in seen_shas:
+                continue
+            seen_shas.add(sha)
+            unique_objects.append(obj)
+        objects_to_send = unique_objects
+
         if objects_to_send:
             # Write pack
             entries = [
