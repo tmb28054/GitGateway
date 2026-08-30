@@ -69,6 +69,14 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Caches
+.*cache
+.*cache/
+
+# Linter config (not used — see steering rule)
+.yamllint
+.cfnlintrc
+
 # Project specific
 trash/
 2026-08-21.tar.gz

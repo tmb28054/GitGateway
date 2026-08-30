@@ -1,5 +1,13 @@
+---
+# yamllint disable rule:line-length
 AWSTemplateFormatVersion: '2010-09-09'
 Description: GitGateway - Serverless Git hosting platform
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W2001  # EnableCodeBuild/EnableAI passed to Lambda env, not CF refs
 
 Parameters:
   DomainName:
