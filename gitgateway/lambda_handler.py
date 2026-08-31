@@ -1491,7 +1491,7 @@ def _render_sidebar(username: str) -> str:
         repo_links = ""
         for repo in sorted(repos, key=lambda r: r.name):
             repo_links += f"""
-            <li style="padding:0.15rem 0 0.15rem 1rem;">
+            <li style="padding:0.15rem 0 0.15rem 1.25rem;">
               <a href="/groups/{group.name}/{repo.name}"
                 style="font-size:0.85rem;color:#586069;">
                 {repo.name}</a>
@@ -1499,18 +1499,28 @@ def _render_sidebar(username: str) -> str:
 
         if not repo_links:
             repo_links = (
-                '<li style="padding:0.15rem 0 0.15rem 1rem;'
+                '<li style="padding:0.15rem 0 0.15rem 1.25rem;'
                 'color:#959da5;font-size:0.8rem;">No repositories</li>'
             )
 
+        # Collapsible group: <details> defaults to collapsed (no `open`).
+        # The summary shows the group name (linked) with a disclosure
+        # triangle; expanding reveals the repo list.
         items += f"""
-        <li style="margin-bottom:0.75rem;">
-          <a href="/groups/{group.name}"
-            style="font-weight:600;font-size:0.9rem;">
-            {group.name}</a>
-          <ul style="list-style:none;margin-top:0.25rem;">
-            {repo_links}
-          </ul>
+        <li style="margin-bottom:0.5rem;">
+          <details>
+            <summary style="cursor:pointer;font-weight:600;
+              font-size:0.9rem;list-style:none;display:flex;
+              align-items:center;gap:0.3rem;">
+              <span class="tri" style="font-size:0.7rem;
+                color:#959da5;">&#9654;</span>
+              <a href="/groups/{group.name}"
+                style="font-weight:600;">{group.name}</a>
+            </summary>
+            <ul style="list-style:none;margin-top:0.25rem;">
+              {repo_links}
+            </ul>
+          </details>
         </li>"""
 
     # Repos accessible via repo-level grants (not in a visible group)
@@ -1545,6 +1555,13 @@ def _render_sidebar(username: str) -> str:
     <aside id="sidebar" style="width:240px;flex-shrink:0;
       border-right:1px solid #e1e4e8;padding:1.5rem 1rem;
       background:#fafbfc;min-height:calc(100vh - 52px);">
+      <style>
+        #sidebar summary::-webkit-details-marker {{ display:none; }}
+        #sidebar details[open] > summary .tri {{
+          transform: rotate(90deg); }}
+        #sidebar summary .tri {{ transition: transform 0.15s;
+          display:inline-block; }}
+      </style>
       <div style="font-size:0.75rem;text-transform:uppercase;
         letter-spacing:0.05em;color:#959da5;margin-bottom:0.75rem;">
         Groups &amp; Repositories
