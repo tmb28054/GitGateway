@@ -1243,7 +1243,7 @@ def _render_web_page(request: Request, user_info: dict) -> Response:
       Roboto, sans-serif; line-height: 1.6; color: #24292e;
       background: #fff; transition: background 0.3s, color 0.3s; }}
     .layout {{ display: flex; align-items: flex-start; }}
-    main {{ flex: 1; max-width: 1000px; margin: 2rem auto 2rem 0.5rem;
+    main {{ flex: 1; margin: 2rem 0.5rem 2rem 0.5rem;
       padding: 0 1.5rem; }}
     #sidebar a:hover {{ text-decoration: underline; }}
     @media (max-width: 700px) {{
