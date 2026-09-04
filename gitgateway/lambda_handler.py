@@ -2201,7 +2201,7 @@ def _render_pr_detail_page(
     if pr.status.value == "open":
         review_actions = f"""
     <div style="border:1px solid #e1e4e8;border-radius:6px;
-      padding:1rem;margin-top:1.5rem;">
+      padding:1rem;margin-bottom:1.5rem;">
       <h3 style="margin-bottom:0.75rem;">Add Comment or Review</h3>
       <textarea id="review-body" rows="4" placeholder="Leave a comment..."
         style="width:100%;padding:0.5rem;border:1px solid #d1d5da;
@@ -2227,7 +2227,7 @@ def _render_pr_detail_page(
     merge_btn = ""
     if pr.status.value == "open" and is_admin:
         merge_btn = f"""
-    <div style="margin-top:1rem;">
+    <div style="margin-bottom:1rem;">
       <button onclick="mergePR()"
         style="background:#2ea44f;color:#fff;border:none;
         padding:0.5rem 1.5rem;border-radius:4px;cursor:pointer;
@@ -2292,15 +2292,15 @@ def _render_pr_detail_page(
 
     {checks_html}
 
+    {merge_btn}
+    {review_actions}
+
     {'<div style="margin-bottom:1.5rem;"><h3>Reviews</h3>' + reviews_html + '</div>' if reviews_html else ''}
 
     <div style="margin-bottom:1.5rem;">
       <h3>Comments ({len(comments)})</h3>
       {comments_html if comments_html else '<p style="color:#586069;">No comments yet.</p>'}
     </div>
-
-    {review_actions}
-    {merge_btn}
 
     <div style="margin-top:2rem;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
