@@ -1901,11 +1901,15 @@ def _render_side_by_side_diff(entry: dict) -> str:
             left_lines.append((left_num, escaped, "#fff"))
             right_lines.append((right_num, escaped, "#fff"))
 
-    # Build HTML table
+    # Build HTML table.
+    # Content columns are sized to fit ~80 monospace chars (80ch) so a
+    # standard 80-column line shows without wrapping; the diff pane
+    # scrolls horizontally when lines are longer.
     rows = ""
     cell_style = (
         "padding:0 0.5rem;font-family:monospace;font-size:0.8rem;"
         "white-space:pre;line-height:1.6;border-right:1px solid #e1e4e8;"
+        "min-width:80ch;"
     )
     num_style = (
         "padding:0 0.5rem;color:#959da5;text-align:right;"
@@ -1925,15 +1929,10 @@ def _render_side_by_side_diff(entry: dict) -> str:
             f'</tr>'
         )
 
+    # No fixed layout: let content columns grow to their 80ch min-width
+    # and rely on the surrounding pane's horizontal scroll.
     return (
-        '<table style="width:100%;border-collapse:collapse;'
-        'table-layout:fixed;">'
-        "<colgroup>"
-        '<col style="width:40px;">'
-        '<col style="width:calc(50% - 40px);">'
-        '<col style="width:40px;">'
-        '<col style="width:calc(50% - 40px);">'
-        "</colgroup>"
+        '<table style="border-collapse:collapse;">'
         f"{rows}</table>"
     )
 
