@@ -1630,6 +1630,181 @@ def _render_user_groups_page(username: str) -> str:
     </table>"""
 
 
+def _load_diff_entries(  # pylint: disable=too-many-locals,too-many-return-statements
+    group: str, repo_name: str, target_branch: str, source_branch: str,
+    ignore_whitespace: bool = False,
+) -> tuple[list, str]:
+    """Load per-file diff entries between two branches.
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        target_branch: The target (base) branch.
+        source_branch: The source (head) branch.
+        ignore_whitespace: If True, drop whitespace-only changes.
+
+    Returns:
+        Tuple of (diff_entries, error_html). If error_html is
+        non-empty, diff_entries is empty and the caller should render
+        the error.
+    """
+    from pathlib import Path as _Path  # pylint: disable=import-outside-toplevel
+    import tempfile as _tempfile  # pylint: disable=import-outside-toplevel
+    from dulwich.repo import Repo as _Repo  # pylint: disable=import-outside-toplevel
+    from gitgateway.storage import (  # pylint: disable=import-outside-toplevel
+        sync_repo_to_local, repo_exists,
+    )
+
+    if not repo_exists(group, repo_name):
+        return [], '<p style="color:#586069;">Repository not found.</p>'
+
+    local_base = _Path(_tempfile.gettempdir()) / "gitgateway"
+    local_base.mkdir(parents=True, exist_ok=True)
+    local_path = local_base / group / f"{repo_name}.git"
+
+    try:
+        sync_repo_to_local(group, repo_name, local_base=local_base)
+        repo = _Repo(str(local_path))
+    except Exception:  # pylint: disable=broad-except
+        return [], '<p style="color:#586069;">Could not load repository.</p>'
+
+    refs = repo.get_refs()
+    target_sha = refs.get(f"refs/heads/{target_branch}".encode())
+    source_sha = refs.get(f"refs/heads/{source_branch}".encode())
+
+    if not source_sha:
+        return [], (
+            f'<p style="color:#586069;">Branch {source_branch} '
+            f'not found.</p>'
+        )
+
+    target_tree = None
+    if target_sha:
+        try:
+            target_tree = repo.object_store[target_sha].tree
+        except (KeyError, Exception):  # pylint: disable=broad-except
+            pass
+
+    try:
+        source_tree = repo.object_store[source_sha].tree
+    except (KeyError, Exception):  # pylint: disable=broad-except
+        return [], (
+            '<p style="color:#586069;">Could not read source branch.</p>'
+        )
+
+    diff_entries = _compute_tree_diff(
+        repo.object_store, target_tree, source_tree,
+    )
+    if not diff_entries:
+        return [], (
+            '<p style="color:#586069;">No differences between '
+            'branches.</p>'
+        )
+
+    if ignore_whitespace:
+        diff_entries = [
+            e for e in diff_entries if not _is_whitespace_only_diff(e)
+        ]
+        if not diff_entries:
+            return [], (
+                '<p style="color:#586069;">No non-whitespace '
+                'differences.</p>'
+            )
+
+    return diff_entries, ""
+
+
+def _compute_pr_diff_split(  # pylint: disable=too-many-locals
+    group: str, repo_name: str, target_branch: str, source_branch: str,
+    lint_failed_files: set | None = None,
+    ignore_whitespace: bool = False,
+) -> str:
+    """Render the PR diff as a file-list (left) + diff-pane (right) view.
+
+    The left pane lists changed files; clicking a file shows its diff
+    in the right pane. Uses inline JS for pane switching (no reload).
+
+    Args:
+        group: Group name.
+        repo_name: Repository name.
+        target_branch: Target (base) branch.
+        source_branch: Source (head) branch.
+        lint_failed_files: Files that failed linting (marked with ✗).
+        ignore_whitespace: If True, drop whitespace-only changes.
+
+    Returns:
+        HTML string for the split diff view.
+    """
+    diff_entries, err = _load_diff_entries(
+        group, repo_name, target_branch, source_branch, ignore_whitespace,
+    )
+    if err:
+        return err
+
+    lint_failed_files = lint_failed_files or set()
+    badge = {
+        "added": '#2ea44f', "deleted": '#cb2431', "modified": '#dbab09',
+    }
+
+    file_items = ""
+    diff_panes = ""
+    for idx, entry in enumerate(diff_entries):
+        path = entry["path"]
+        status = entry.get("status", "modified")
+        color = badge.get(status, "#586069")
+        failed = path in lint_failed_files
+        lint_mark = (
+            '<span style="color:#cb2431;" title="Lint failed">✗</span> '
+            if failed else ""
+        )
+        active = "background:#eaf5ff;" if idx == 0 else ""
+        file_items += f"""
+        <li class="diff-file-item" data-idx="{idx}"
+          onclick="showDiffFile({idx})"
+          style="padding:0.4rem 0.6rem;cursor:pointer;font-size:0.82rem;
+            border-bottom:1px solid #f0f0f0;display:flex;
+            align-items:center;gap:0.35rem;{active}">
+          <span style="width:8px;height:8px;border-radius:2px;
+            background:{color};flex-shrink:0;"></span>
+          {lint_mark}
+          <span style="word-break:break-all;">{path}</span>
+        </li>"""
+
+        show = "block" if idx == 0 else "none"
+        diff_panes += f"""
+        <div class="diff-file-pane" data-idx="{idx}"
+          style="display:{show};">
+          <div style="background:#f6f8fa;padding:0.5rem 1rem;
+            border-bottom:1px solid #e1e4e8;font-weight:600;
+            font-size:0.85rem;">{lint_mark}{path}</div>
+          <div style="overflow-x:auto;">{_render_side_by_side_diff(entry)}</div>
+        </div>"""
+
+    return f"""
+    <div style="display:flex;border:1px solid #e1e4e8;border-radius:6px;
+      overflow:hidden;min-height:400px;">
+      <ul id="diff-file-list" style="list-style:none;width:260px;
+        flex-shrink:0;border-right:1px solid #e1e4e8;margin:0;padding:0;
+        overflow-y:auto;max-height:80vh;background:#fafbfc;">
+        {file_items}
+      </ul>
+      <div id="diff-pane-container" style="flex:1;overflow:auto;
+        max-height:80vh;">
+        {diff_panes}
+      </div>
+    </div>
+    <script>
+    function showDiffFile(idx) {{
+      document.querySelectorAll('.diff-file-pane').forEach(function(p) {{
+        p.style.display = (p.dataset.idx == idx) ? 'block' : 'none';
+      }});
+      document.querySelectorAll('.diff-file-item').forEach(function(i) {{
+        i.style.background = (i.dataset.idx == idx) ? '#eaf5ff' : '';
+      }});
+    }}
+    </script>"""
+
+
 def _compute_pr_diff(
     group: str, repo_name: str, target_branch: str, source_branch: str,
     lint_failed_files: set | None = None,
@@ -1648,67 +1823,11 @@ def _compute_pr_diff(
     Returns:
         HTML string showing the diff.
     """
-    import boto3  # pylint: disable=import-outside-toplevel
-    from pathlib import Path as _Path  # pylint: disable=import-outside-toplevel
-    import tempfile as _tempfile  # pylint: disable=import-outside-toplevel
-    from dulwich.repo import Repo as _Repo  # pylint: disable=import-outside-toplevel
-    from gitgateway.storage import (  # pylint: disable=import-outside-toplevel
-        sync_repo_to_local, repo_exists,
+    diff_entries, err = _load_diff_entries(
+        group, repo_name, target_branch, source_branch, ignore_whitespace,
     )
-
-    if not repo_exists(group, repo_name):
-        return '<p style="color:#586069;">Repository not found.</p>'
-
-    local_base = _Path(_tempfile.gettempdir()) / "gitgateway"
-    local_base.mkdir(parents=True, exist_ok=True)
-    local_path = local_base / group / f"{repo_name}.git"
-
-    try:
-        sync_repo_to_local(group, repo_name, local_base=local_base)
-        repo = _Repo(str(local_path))
-    except Exception:  # pylint: disable=broad-except
-        return '<p style="color:#586069;">Could not load repository.</p>'
-
-    # Resolve branch SHAs
-    refs = repo.get_refs()
-    target_ref = f"refs/heads/{target_branch}".encode()
-    source_ref = f"refs/heads/{source_branch}".encode()
-
-    target_sha = refs.get(target_ref)
-    source_sha = refs.get(source_ref)
-
-    if not source_sha:
-        return f'<p style="color:#586069;">Branch {source_branch} not found.</p>'
-
-    # Get trees
-    target_tree = None
-    if target_sha:
-        try:
-            target_commit = repo.object_store[target_sha]
-            target_tree = target_commit.tree
-        except (KeyError, Exception):  # pylint: disable=broad-except
-            pass
-
-    try:
-        source_commit = repo.object_store[source_sha]
-        source_tree = source_commit.tree
-    except (KeyError, Exception):  # pylint: disable=broad-except
-        return '<p style="color:#586069;">Could not read source branch.</p>'
-
-    # Compute diff
-    diff_entries = _compute_tree_diff(repo.object_store, target_tree, source_tree)
-
-    if not diff_entries:
-        return '<p style="color:#586069;">No differences between branches.</p>'
-
-    # Filter whitespace-only changes if requested
-    if ignore_whitespace:
-        diff_entries = [
-            e for e in diff_entries
-            if not _is_whitespace_only_diff(e)
-        ]
-        if not diff_entries:
-            return '<p style="color:#586069;">No non-whitespace differences.</p>'
+    if err:
+        return err
 
     # Render diff
     html = ""
@@ -2234,9 +2353,9 @@ def _render_pr_detail_page(
         font-size:1rem;">Merge Pull Request</button>
     </div>"""
 
-    # Compute diff between target and source branches
+    # Compute diff between target and source branches (split view)
     ignore_ws = "w=1" in query_string
-    diff_html = _compute_pr_diff(
+    diff_html = _compute_pr_diff_split(
         group, repo_name, pr.target_branch, pr.source_branch,
         lint_failed_files, ignore_whitespace=ignore_ws,
     )
@@ -2290,19 +2409,33 @@ def _render_pr_detail_page(
       {f'<p style="margin-top:0.75rem;">{pr.description}</p>' if pr.description else ''}
     </div>
 
-    {checks_html}
-
-    {merge_btn}
-    {review_actions}
-
-    {'<div style="margin-bottom:1.5rem;"><h3>Reviews</h3>' + reviews_html + '</div>' if reviews_html else ''}
-
-    <div style="margin-bottom:1.5rem;">
-      <h3>Comments ({len(comments)})</h3>
-      {comments_html if comments_html else '<p style="color:#586069;">No comments yet.</p>'}
+    <div style="display:flex;gap:0.5rem;border-bottom:1px solid #e1e4e8;
+      margin-bottom:1.5rem;">
+      <button id="subtab-conversation" onclick="showSubtab('conversation')"
+        style="background:none;border:none;border-bottom:2px solid #f9826c;
+        padding:0.5rem 1rem;cursor:pointer;font-weight:600;
+        font-size:0.95rem;color:#24292e;">Conversation</button>
+      <button id="subtab-diff" onclick="showSubtab('diff')"
+        style="background:none;border:none;border-bottom:2px solid transparent;
+        padding:0.5rem 1rem;cursor:pointer;font-weight:600;
+        font-size:0.95rem;color:#586069;">Diff</button>
     </div>
 
-    <div style="margin-top:2rem;">
+    <div id="pane-conversation">
+      {checks_html}
+
+      {merge_btn}
+      {review_actions}
+
+      {'<div style="margin-bottom:1.5rem;"><h3>Reviews</h3>' + reviews_html + '</div>' if reviews_html else ''}
+
+      <div style="margin-bottom:1.5rem;">
+        <h3>Comments ({len(comments)})</h3>
+        {comments_html if comments_html else '<p style="color:#586069;">No comments yet.</p>'}
+      </div>
+    </div>
+
+    <div id="pane-diff" style="display:none;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
         <h3 style="margin:0;">Files Changed</h3>
         <label style="display:flex;align-items:center;gap:0.5rem;
@@ -2318,10 +2451,31 @@ def _render_pr_detail_page(
     </div>
 
     <script>
+    function showSubtab(name) {{
+      const conv = document.getElementById('pane-conversation');
+      const diff = document.getElementById('pane-diff');
+      const tc = document.getElementById('subtab-conversation');
+      const td = document.getElementById('subtab-diff');
+      if (name === 'diff') {{
+        conv.style.display = 'none'; diff.style.display = 'block';
+        td.style.borderBottomColor = '#f9826c'; td.style.color = '#24292e';
+        tc.style.borderBottomColor = 'transparent'; tc.style.color = '#586069';
+        if (location.hash !== '#diff') history.replaceState(null, '', '#diff');
+      }} else {{
+        conv.style.display = 'block'; diff.style.display = 'none';
+        tc.style.borderBottomColor = '#f9826c'; tc.style.color = '#24292e';
+        td.style.borderBottomColor = 'transparent'; td.style.color = '#586069';
+        if (location.hash === '#diff') history.replaceState(null, '', ' ');
+      }}
+    }}
+    // Honor #diff on load (e.g. shared links, whitespace toggle reload)
+    if (window.location.hash === '#diff') {{ showSubtab('diff'); }}
+
     function toggleWhitespace(hide) {{
       const url = new URL(window.location);
       if (hide) {{ url.searchParams.set('w', '1'); }}
       else {{ url.searchParams.delete('w'); }}
+      url.hash = 'diff';  // stay on the Diff tab after reload
       window.location = url.toString();
     }}
     async function submitComment() {{
