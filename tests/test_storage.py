@@ -101,8 +101,8 @@ class TestInitBareRepo:
     def test_raises_on_git_failure(self, s3, tmp_path: Path) -> None:
         """Raises StorageError when git init fails."""
         with patch(
-            "gitgateway.storage.subprocess.run",
-            side_effect=FileNotFoundError("git not found"),
+            "dulwich.repo.Repo.init_bare",
+            side_effect=OSError("git not found"),
         ):
             with pytest.raises(StorageError, match="Failed to initialize"):
                 init_bare_repo(
@@ -194,6 +194,31 @@ class TestSyncRepoToS3:
                 tmp_path / "nonexistent", "team", "app",
                 bucket=BUCKET, s3_client=s3,
             )
+
+    def test_deletes_stale_s3_keys(self, s3, tmp_path: Path) -> None:
+        """Objects removed locally are deleted from S3 on re-sync."""
+        repo_path = tmp_path / "team" / "app.git"
+        refs_dir = repo_path / "refs" / "heads"
+        refs_dir.mkdir(parents=True)
+        (repo_path / "HEAD").write_text("ref: refs/heads/main\n")
+        (refs_dir / "main").write_text("abc123\n")
+        (refs_dir / "feature").write_text("def456\n")
+
+        # First sync uploads both refs.
+        sync_repo_to_s3(
+            repo_path, "team", "app", bucket=BUCKET, s3_client=s3,
+        )
+
+        # Remove one ref locally, then re-sync.
+        (refs_dir / "feature").unlink()
+        sync_repo_to_s3(
+            repo_path, "team", "app", bucket=BUCKET, s3_client=s3,
+        )
+
+        objects = _list_s3_objects(BUCKET, "repos/team/app.git/", s3)
+        keys = {k.split("repos/team/app.git/")[1] for k in objects}
+        assert "refs/heads/main" in keys
+        assert "refs/heads/feature" not in keys
 
 
 class TestDeleteRepoStorage:

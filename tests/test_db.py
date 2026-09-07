@@ -11,6 +11,8 @@ from moto import mock_aws
 from gitgateway.db import (
     ConflictError,
     NotFoundError,
+    _delete_all_items_with_pk,
+    _delete_items_with_pk_prefix,
     _get_table,
     check_permission,
     create_group,
@@ -534,3 +536,148 @@ class TestGetTable:
         # Request protection for 'main' which doesn't exist
         result = get_branch_protection("team", "app", "main", dynamodb)
         assert result is None
+
+
+class TestDeleteHelpers:
+    """Tests for the private delete-loop helpers."""
+
+    def test_delete_all_items_with_pk(self, dynamodb) -> None:
+        """Deletes every item under a partition key."""
+        table = dynamodb.Table("gitgateway-repos")
+        table.put_item(Item={"PK": "REPO#team/app", "SK": "EVENT#1"})
+        table.put_item(Item={"PK": "REPO#team/app", "SK": "EVENT#2"})
+
+        _delete_all_items_with_pk(table, "REPO#team/app")
+
+        remaining = table.query(
+            KeyConditionExpression="PK = :pk",
+            ExpressionAttributeValues={":pk": "REPO#team/app"},
+        )["Items"]
+        assert remaining == []
+
+    def test_delete_items_with_pk_prefix(self, dynamodb) -> None:
+        """Deletes items whose PK starts with a prefix."""
+        table = dynamodb.Table("gitgateway-repos")
+        table.put_item(Item={"PK": "TREE#team/app#main", "SK": "FILE#a"})
+        table.put_item(Item={"PK": "TREE#team/app#feat", "SK": "FILE#b"})
+
+        _delete_items_with_pk_prefix(table, "TREE#team/app")
+
+        leftover = table.scan(
+            FilterExpression="begins_with(PK, :p)",
+            ExpressionAttributeValues={":p": "TREE#team/app"},
+        )["Items"]
+        assert leftover == []
+
+
+class TestDeleteRepoTreeCleanup:
+    """Cover the tree-cache cleanup branch of delete_repo."""
+
+    def test_delete_repo_removes_tree_cache(self, dynamodb) -> None:
+        """delete_repo also clears TREE# entries for the repo."""
+        create_group(Group(name="team"), dynamodb)
+        create_repo(Repo(group="team", name="app"), dynamodb)
+        table = dynamodb.Table("gitgateway-repos")
+        table.put_item(Item={
+            "PK": "TREE#team/app#main", "SK": "FILE#README.md",
+        })
+
+        delete_repo("team", "app", dynamodb)
+
+        leftover = table.scan(
+            FilterExpression="begins_with(PK, :p)",
+            ExpressionAttributeValues={":p": "TREE#team/app"},
+        )["Items"]
+        assert leftover == []
+
+    def test_delete_repo_tree_cleanup_failure_ignored(self, dynamodb) -> None:
+        """A failure clearing the tree cache does not fail delete_repo."""
+        create_group(Group(name="team"), dynamodb)
+        create_repo(Repo(group="team", name="app"), dynamodb)
+
+        with patch(
+            "gitgateway.db._delete_items_with_pk_prefix",
+            side_effect=RuntimeError("boom"),
+        ):
+            # Should complete without raising despite the cleanup failure.
+            delete_repo("team", "app", dynamodb)
+
+        with pytest.raises(NotFoundError):
+            get_repo("team", "app", dynamodb)
+
+
+class TestListPagination:
+    """Cover the LastEvaluatedKey pagination loops in list_* functions."""
+
+    @staticmethod
+    def _paging_resource(pages: list[dict], op: str):
+        """Build a fake resource whose table.<op> returns paged results.
+
+        Args:
+            pages: Sequence of response dicts to return in order.
+            op: Either 'query' or 'scan'.
+        """
+        from unittest.mock import MagicMock
+
+        table = MagicMock()
+        getattr(table, op).side_effect = pages
+        resource = MagicMock()
+        resource.Table.return_value = table
+        return resource
+
+    def test_list_groups_paginates(self) -> None:
+        """list_groups follows LastEvaluatedKey across pages."""
+        pages = [
+            {
+                "Items": [{"PK": "GROUP#a", "SK": "METADATA", "name": "a"}],
+                "LastEvaluatedKey": {"PK": "GROUP#a", "SK": "METADATA"},
+            },
+            {
+                "Items": [{"PK": "GROUP#b", "SK": "METADATA", "name": "b"}],
+            },
+        ]
+        resource = self._paging_resource(pages, "scan")
+        groups = list_groups(resource)
+        assert {g.name for g in groups} == {"a", "b"}
+
+    def test_list_repos_group_paginates(self) -> None:
+        """list_repos(group=...) follows LastEvaluatedKey via query."""
+        pages = [
+            {
+                "Items": [{
+                    "PK": "GROUP#team", "SK": "REPO#one", "name": "one",
+                    "group": "team",
+                }],
+                "LastEvaluatedKey": {"PK": "GROUP#team", "SK": "REPO#one"},
+            },
+            {
+                "Items": [{
+                    "PK": "GROUP#team", "SK": "REPO#two", "name": "two",
+                    "group": "team",
+                }],
+            },
+        ]
+        resource = self._paging_resource(pages, "query")
+        repos = list_repos("team", resource)
+        assert {r.name for r in repos} == {"one", "two"}
+
+    def test_list_repos_all_paginates(self) -> None:
+        """list_repos() (no group) follows LastEvaluatedKey via scan."""
+        pages = [
+            {
+                "Items": [{
+                    "PK": "GROUP#team", "SK": "REPO#one", "name": "one",
+                    "group": "team",
+                }],
+                "LastEvaluatedKey": {"PK": "GROUP#team", "SK": "REPO#one"},
+            },
+            {
+                "Items": [{
+                    "PK": "GROUP#other", "SK": "REPO#two", "name": "two",
+                    "group": "other",
+                }],
+            },
+        ]
+        resource = self._paging_resource(pages, "scan")
+        repos = list_repos(None, resource)
+        assert {r.name for r in repos} == {"one", "two"}

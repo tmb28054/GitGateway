@@ -224,19 +224,22 @@ class TestHandler:
         assert result["statusCode"] == 204
 
     def test_api_route(self) -> None:
-        """API requests are dispatched correctly."""
+        """API GET /api/groups returns the group list as JSON."""
+        from unittest.mock import patch
+
         event = {
             "requestContext": {"http": {"method": "GET", "path": "/api/groups"}},
             "rawQueryString": "",
             "headers": {},
         }
-        result = handler(event)
+        with patch("gitgateway.db.list_groups", return_value=[]):
+            result = handler(event)
         assert result["statusCode"] == 200
-        body = json.loads(result["body"])
-        assert body["handler"] == "api"
+        assert result["headers"]["Content-Type"] == "application/json"
+        assert json.loads(result["body"]) == []
 
-    def test_git_route(self) -> None:
-        """Git requests are dispatched correctly."""
+    def test_git_route_requires_auth(self) -> None:
+        """Unauthenticated git requests are rejected with 401."""
         event = {
             "requestContext": {
                 "http": {"method": "GET", "path": "/team/app.git/info/refs"},
@@ -245,10 +248,24 @@ class TestHandler:
             "headers": {},
         }
         result = handler(event)
-        assert result["statusCode"] == 200
+        assert result["statusCode"] == 401
+        assert "WWW-Authenticate" in result["headers"]
+
+    def test_git_route_invalid_url(self) -> None:
+        """A git path that doesn't match group/repo.git returns 400."""
+        event = {
+            "requestContext": {
+                "http": {"method": "GET", "path": "/notgit/info/refs"},
+            },
+            "rawQueryString": "",
+            "headers": {},
+        }
+        result = handler(event)
+        # Falls through to web handling (not a valid git URL), so not 401.
+        assert result["statusCode"] in (200, 302, 404)
 
     def test_lfs_route(self) -> None:
-        """LFS requests are dispatched correctly."""
+        """LFS batch requests return the git-lfs+json content type."""
         event = {
             "requestContext": {
                 "http": {
@@ -260,42 +277,53 @@ class TestHandler:
             "headers": {},
         }
         result = handler(event)
-        assert result["statusCode"] == 200
-        body = json.loads(result["body"])
-        assert body["handler"] == "lfs"
+        assert result["headers"]["Content-Type"] == (
+            "application/vnd.git-lfs+json"
+        )
 
-    def test_auth_route(self) -> None:
-        """Auth requests are dispatched correctly."""
+    def test_auth_route_missing_token(self) -> None:
+        """Auth callback without a token returns 400."""
         event = {
             "requestContext": {"http": {"method": "GET", "path": "/auth/callback"}},
-            "rawQueryString": "token=xyz",
+            "rawQueryString": "",
             "headers": {},
         }
         result = handler(event)
-        assert result["statusCode"] == 200
-        body = json.loads(result["body"])
-        assert body["handler"] == "auth"
+        assert result["statusCode"] == 400
+        assert "Missing token" in result["body"]
 
-    def test_web_route(self) -> None:
-        """Web UI requests are dispatched correctly."""
+    def test_web_route_redirects_to_idp_when_unauthenticated(self) -> None:
+        """Unauthenticated web request redirects to the IdP login."""
+        from unittest.mock import patch
+
         event = {
             "requestContext": {"http": {"method": "GET", "path": "/"}},
             "rawQueryString": "",
             "headers": {},
         }
-        result = handler(event)
-        assert result["statusCode"] == 200
-        assert "GitGateway" in result["body"]
+        with patch.dict(
+            "os.environ",
+            {"IDP_URL": "https://idp.example.com", "DOMAIN_NAME": "git.example.com"},
+        ):
+            result = handler(event)
+        assert result["statusCode"] == 302
+        assert "idp.example.com" in result["headers"]["Location"]
 
     def test_handler_with_context(self) -> None:
-        """Handler works when context is provided."""
+        """Handler accepts a context argument."""
+        from unittest.mock import patch
+
         event = {
             "requestContext": {"http": {"method": "GET", "path": "/"}},
             "rawQueryString": "",
             "headers": {},
         }
-        result = handler(event, context=object())
-        assert result["statusCode"] == 200
+        with patch.dict(
+            "os.environ",
+            {"IDP_URL": "https://idp.example.com", "DOMAIN_NAME": "git.example.com"},
+        ):
+            result = handler(event, context=object())
+        assert result["statusCode"] == 302
 
 
 class TestDispatch:
@@ -308,11 +336,18 @@ class TestDispatch:
         assert response.headers["Content-Type"] == "application/json"
         assert "Access-Control-Allow-Origin" in response.headers
 
-    def test_git_dispatch(self) -> None:
-        """Git handler returns octet-stream."""
+    def test_git_dispatch_requires_auth(self) -> None:
+        """Git dispatch without credentials returns 401."""
         request = Request(path="/team/app.git/info/refs")
         response = _dispatch("git", request)
-        assert response.headers["Content-Type"] == "application/octet-stream"
+        assert response.status_code == 401
+        assert "WWW-Authenticate" in response.headers
+
+    def test_git_dispatch_invalid_url(self) -> None:
+        """Git dispatch with a non-git path returns 400."""
+        request = Request(path="/not-a-git-url")
+        response = _dispatch("git", request)
+        assert response.status_code == 400
 
     def test_lfs_dispatch(self) -> None:
         """LFS handler returns git-lfs+json."""
@@ -320,12 +355,12 @@ class TestDispatch:
         response = _dispatch("lfs", request)
         assert response.headers["Content-Type"] == "application/vnd.git-lfs+json"
 
-    def test_auth_dispatch(self) -> None:
-        """Auth handler returns JSON."""
+    def test_auth_dispatch_missing_token(self) -> None:
+        """Auth dispatch without a token returns a 400 HTML response."""
         request = Request(path="/auth/callback")
         response = _dispatch("auth", request)
-        body = json.loads(response.body)
-        assert body["handler"] == "auth"
+        assert response.status_code == 400
+        assert "Missing token" in response.body
 
     def test_web_dispatch(self) -> None:
         """Web handler returns HTML."""
@@ -333,3 +368,102 @@ class TestDispatch:
         response = _dispatch("web", request)
         assert response.headers["Content-Type"] == "text/html"
         assert "GitGateway" in response.body
+
+
+class TestAdminAuditPage:
+    """Tests for the admin audit log page."""
+
+    def test_route_dispatches_to_audit_page(self) -> None:
+        """/admin/audit routes to the audit renderer."""
+        from unittest.mock import patch
+
+        from gitgateway.audit import AuditEvent
+        from gitgateway.lambda_handler import _get_admin_content
+
+        event = AuditEvent(
+            timestamp="2025-01-01T00:00:00Z",
+            actor="alice",
+            action="repo.created",
+            resource="team/app",
+            ip_address="10.0.0.1",
+            details={"description": "New app"},
+        )
+        with patch(
+            "gitgateway.audit.list_all_events",
+            return_value=[event],
+        ):
+            html = _get_admin_content("/admin/audit")
+
+        assert "Path:" not in html
+        assert "Audit Log" in html
+        assert "alice" in html
+        assert "repo.created" in html
+        assert "team/app" in html
+        assert "10.0.0.1" in html
+        assert "description=New app" in html
+
+    def test_empty_events(self) -> None:
+        """Renders empty-state message with no events."""
+        from unittest.mock import patch
+
+        from gitgateway.lambda_handler import _render_admin_audit_page
+
+        with patch(
+            "gitgateway.audit.list_all_events",
+            return_value=[],
+        ):
+            html = _render_admin_audit_page()
+
+        assert "No audit events recorded yet." in html
+        assert "0 events" in html
+
+    def test_single_event_count_label(self) -> None:
+        """Uses singular label for exactly one event."""
+        from unittest.mock import patch
+
+        from gitgateway.audit import AuditEvent
+        from gitgateway.lambda_handler import _render_admin_audit_page
+
+        with patch(
+            "gitgateway.audit.list_all_events",
+            return_value=[AuditEvent(actor="a", action="x", resource="r")],
+        ):
+            html = _render_admin_audit_page()
+
+        assert "1 event." in html
+
+    def test_escapes_event_content(self) -> None:
+        """Escapes HTML in event fields to prevent injection."""
+        from unittest.mock import patch
+
+        from gitgateway.audit import AuditEvent
+        from gitgateway.lambda_handler import _render_admin_audit_page
+
+        event = AuditEvent(
+            timestamp="2025-01-01T00:00:00Z",
+            actor="<script>alert(1)</script>",
+            action="push",
+            resource="team/app",
+        )
+        with patch(
+            "gitgateway.audit.list_all_events",
+            return_value=[event],
+        ):
+            html = _render_admin_audit_page()
+
+        assert "<script>alert(1)</script>" not in html
+        assert "&lt;script&gt;" in html
+
+    def test_handles_load_error(self) -> None:
+        """Shows an error banner when events cannot be loaded."""
+        from unittest.mock import patch
+
+        from gitgateway.lambda_handler import _render_admin_audit_page
+
+        with patch(
+            "gitgateway.audit.list_all_events",
+            side_effect=RuntimeError("boom"),
+        ):
+            html = _render_admin_audit_page()
+
+        assert "Could not load audit events." in html

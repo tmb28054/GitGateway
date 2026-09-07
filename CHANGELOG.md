@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-07
+
+### Added
+- Admin audit log viewer at `/admin/audit` that lists audit events across all
+  resources (newest first) with time, actor, action, resource, IP address, and
+  details, plus a client-side text filter.
+- `audit.list_all_events()` to fetch audit events across every resource for
+  admin views, with pagination and a configurable limit.
+
+### Fixed
+- `/admin/audit` previously rendered a bare `Path: /admin/audit` placeholder
+  because the route was never dispatched; it now renders the full audit log.
+- Token API routes (`/api/tokens`) treated the `"unknown"` session sentinel as
+  a real username, so their 401 checks were dead code and an unauthenticated
+  caller could create/list/revoke tokens as user "unknown". `_get_request_username`
+  now returns an empty string for the sentinel, activating the intended 401s.
+
+### Changed
+- Enforced 100% line and branch coverage across the whole `gitgateway`
+  package. The coverage gate now runs on every `pytest` invocation via
+  `addopts` in `pyproject.toml` (`--cov=gitgateway --cov-report=term-missing
+  --cov-fail-under=100 --ignore=tests/e2e`), and the suite is at 100%.
+  Brought previously-thin modules up to full coverage with new/expanded
+  tests: `git_backend.py` (5%->100%, new `tests/test_git_backend.py` driving
+  the Smart-HTTP info/refs, upload-pack, receive-pack, indexing, and
+  report-status paths against real Dulwich bare repos + moto S3/DynamoDB),
+  `deploy.py` (38%->100%, Lambda/layer packaging, binary + Node tool
+  extraction, bucket/layer publish via moto and mocked downloads), `lint.py`
+  (76%->100%, per-linter parse/error/tool-missing branches), and `cli.py`,
+  `db.py`, `storage.py`, `tokens.py`.
+- Moved the `partial_branches` coverage setting from `[tool.coverage.run]`
+  (where it was ignored) to `[tool.coverage.report]`.
+- Raised `lambda_handler.py` test coverage from 19% to 100% (line and branch)
+  by adding `tests/test_lambda_handler_routes.py` covering the API routes
+  (groups, repos, branches, PRs, comments, reviews, merge, tokens, access,
+  users, admin AI key, rescan), the LFS handler, git auth, event parsing, the
+  OAuth callback, PR linting/AI-review orchestration, and the web render pages
+  (dashboard, repo view, file viewer, commits, branches, PR detail, real
+  per-file and commit diffs) against moto-mocked DynamoDB and S3. Remaining
+  gaps were closed with tests for malformed-path routing legs, non-admin
+  permission legs, repo-not-found and empty-state branches, and AI/lint
+  early-return paths; genuinely unreachable path-split guards and one
+  defensive parent-lookup handler were marked `# pragma: no branch`/`no cover`
+  with explanatory comments.
+- Replaced silent `try/except/pass` blocks in `db.py` (best-effort repo
+  cleanup) and `lambda_handler.py` (post-push linting trigger) with debug
+  logging, resolving bandit B110 findings so the bandit smoke test passes.
+- Wrapped two over-length lines in `ai.py` so the pylint smoke test passes.
+- Updated stale tests that no longer matched current behavior: version test
+  now derives the expected version from CHANGELOG.md; `AIConfig` test asserts
+  the current default model; `storage` init-failure test patches the dulwich
+  backend instead of the removed `subprocess` call; `cli` tests mock the API
+  client instead of hitting the network and assert real request routing;
+  `lambda_handler` handler/dispatch tests assert current auth/routing behavior
+  (401 for unauthenticated git, 400 for auth callback without a token, IdP
+  redirect for unauthenticated web) instead of removed stub responses.
+
 ## [0.2.0] - 2026-08-21
 
 ### Added

@@ -47,6 +47,9 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+# Stray dir a mis-configured MagicMock can create if a mocked tempfile
+# path leaks into a filesystem write during tests.
+MagicMock/
 
 # Translations
 *.mo

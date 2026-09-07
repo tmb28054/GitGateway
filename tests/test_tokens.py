@@ -303,3 +303,149 @@ class TestRevokeToken:
 
         with pytest.raises(TokenNotFoundError):
             revoke_token("topaz", "nonexistent")
+
+
+class TestIsExpiredMalformed:
+    """Cover the is_expired exception branch."""
+
+    def test_malformed_expiry_returns_false(self) -> None:
+        """A non-ISO expires_at is treated as not expired."""
+        pat = PersonalAccessToken(expires_at="not-a-date")
+        assert pat.is_expired() is False
+
+
+class TestTokensWithMoto:
+    """End-to-end token flows against a mocked DynamoDB table.
+
+    Exercises the default _get_table resource path, the last_used_at
+    update, expiry rejection, and revoke's hash-lookup update.
+    """
+
+    @pytest.fixture
+    def dynamodb(self):
+        """Create the gitgateway-repos table used by tokens."""
+        import boto3
+        from moto import mock_aws
+
+        with mock_aws():
+            resource = boto3.resource("dynamodb", region_name="us-east-1")
+            resource.create_table(
+                TableName="gitgateway-repos",
+                KeySchema=[
+                    {"AttributeName": "PK", "KeyType": "HASH"},
+                    {"AttributeName": "SK", "KeyType": "RANGE"},
+                ],
+                AttributeDefinitions=[
+                    {"AttributeName": "PK", "AttributeType": "S"},
+                    {"AttributeName": "SK", "AttributeType": "S"},
+                ],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            yield resource
+
+    def test_generate_validate_revoke_roundtrip(self, dynamodb) -> None:
+        """Generate a token, validate it, then revoke it (default table)."""
+        raw, pat = generate_token(
+            username="topaz", description="d", scope=TokenScope.READ_WRITE,
+        )
+        # validate_token uses the default _get_table (no resource passed).
+        validated = validate_token(raw)
+        assert validated.username == "topaz"
+
+        # Second validation updates last_used_at again.
+        validate_token(raw)
+
+        revoke_token("topaz", pat.token_id)
+        with pytest.raises(TokenError):
+            validate_token(raw)
+
+    def test_validate_expired_token(self, dynamodb) -> None:
+        """A token past its expiry raises TokenExpiredError.
+
+        Passes the resource explicitly to also cover the _get_table
+        branch where a resource is provided.
+        """
+        raw, _pat = generate_token(
+            username="topaz", description="d",
+            scope=TokenScope.READ, expiry_days=-1,
+            dynamodb_resource=dynamodb,
+        )
+        with pytest.raises(TokenExpiredError):
+            validate_token(raw, dynamodb_resource=dynamodb)
+
+    def test_validate_no_expiry(self, dynamodb) -> None:
+        """A token with an empty expires_at skips the expiry check."""
+        raw, _pat = generate_token(
+            username="topaz", description="d", scope=TokenScope.READ,
+            dynamodb_resource=dynamodb,
+        )
+        # Blank out expires_at on the hash-lookup entry.
+        table = dynamodb.Table("gitgateway-repos")
+        token_hash = _hash_token(raw)
+        table.update_item(
+            Key={"PK": f"TOKEN_HASH#{token_hash}", "SK": "META"},
+            UpdateExpression="SET expires_at = :e",
+            ExpressionAttributeValues={":e": ""},
+        )
+        result = validate_token(raw, dynamodb_resource=dynamodb)
+        assert result.username == "topaz"
+
+    def test_validate_malformed_expiry_ignored(self, dynamodb) -> None:
+        """A malformed expires_at is caught and validation succeeds.
+
+        Covers the except (ValueError, TypeError) branch of the
+        expiry check in validate_token.
+        """
+        raw, _pat = generate_token(
+            username="topaz", description="d", scope=TokenScope.READ,
+            dynamodb_resource=dynamodb,
+        )
+        table = dynamodb.Table("gitgateway-repos")
+        token_hash = _hash_token(raw)
+        table.update_item(
+            Key={"PK": f"TOKEN_HASH#{token_hash}", "SK": "META"},
+            UpdateExpression="SET expires_at = :e",
+            ExpressionAttributeValues={":e": "garbage-date"},
+        )
+        result = validate_token(raw, dynamodb_resource=dynamodb)
+        assert result.username == "topaz"
+
+    def test_revoke_without_hash_skips_hash_update(self, dynamodb) -> None:
+        """Revoking a token stored without a hash skips the hash update."""
+        table = dynamodb.Table("gitgateway-repos")
+        # Seed a user token entry that has no token_hash attribute.
+        table.put_item(Item={
+            "PK": "USER#topaz",
+            "SK": "TOKEN#nohash01",
+            "token_id": "nohash01",
+            "username": "topaz",
+            "scope": "read",
+            "revoked": False,
+        })
+        revoke_token("topaz", "nohash01", dynamodb_resource=dynamodb)
+        got = table.get_item(
+            Key={"PK": "USER#topaz", "SK": "TOKEN#nohash01"},
+        )["Item"]
+        assert got["revoked"] is True
+
+    def test_last_used_update_failure_is_ignored(self, dynamodb) -> None:
+        """A failure updating last_used_at does not fail validation."""
+        raw, _pat = generate_token(
+            username="topaz", description="d", scope=TokenScope.READ,
+        )
+        real_table = dynamodb.Table("gitgateway-repos")
+
+        class _FailingUpdate:
+            """Proxy that raises on update_item but passes get_item."""
+
+            def get_item(self, **kwargs):
+                return real_table.get_item(**kwargs)
+
+            def update_item(self, **kwargs):
+                raise RuntimeError("update failed")
+
+        with patch(
+            "gitgateway.tokens._get_table", return_value=_FailingUpdate(),
+        ):
+            result = validate_token(raw)
+        assert result.username == "topaz"

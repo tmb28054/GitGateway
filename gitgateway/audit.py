@@ -226,6 +226,45 @@ def get_audit_log(
     return events
 
 
+def list_all_events(
+    limit: int = 200,
+    dynamodb_resource: object = None,
+) -> list[AuditEvent]:
+    """List audit events across all resources, newest first.
+
+    Scans the audit table (acceptable for admin queries) and sorts
+    by timestamp descending. Suitable for the admin audit viewer.
+
+    Args:
+        limit: Maximum number of events to return.
+        dynamodb_resource: Optional boto3 DynamoDB resource.
+
+    Returns:
+        List of AuditEvent objects sorted newest first.
+    """
+    table = _get_table(dynamodb_resource)
+
+    events: list[AuditEvent] = []
+    scan_kwargs: dict = {
+        "FilterExpression": "begins_with(SK, :prefix)",
+        "ExpressionAttributeValues": {":prefix": "EVENT#"},
+    }
+
+    while True:
+        response = table.scan(**scan_kwargs)
+        events.extend(
+            AuditEvent.from_dict(item)
+            for item in response.get("Items", [])
+        )
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        scan_kwargs["ExclusiveStartKey"] = last_key
+
+    events.sort(key=lambda e: e.timestamp, reverse=True)
+    return events[:limit]
+
+
 def get_user_audit_log(
     username: str,
     dynamodb_resource: object = None,

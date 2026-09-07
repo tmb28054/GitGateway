@@ -72,6 +72,12 @@ gitgateway = ["template.yaml", "sast_buildspec.yaml", "web/templates/**/*", "web
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = [
+    "--cov=gitgateway",
+    "--cov-report=term-missing",
+    "--cov-fail-under=100",
+    "--ignore=tests/e2e",
+]
 markers = [
     "smoke: Smoke tests for basic functionality",
     "e2e: End-to-end integration tests against deployed instance",
@@ -80,9 +86,6 @@ markers = [
 [tool.coverage.run]
 source = ["gitgateway"]
 branch = true
-partial_branches = [
-    "pragma: no branch",
-]
 
 [tool.coverage.report]
 fail_under = 100
@@ -91,6 +94,9 @@ exclude_lines = [
     "pragma: no cover",
     "if __name__ == .__main__.",
     "if TYPE_CHECKING:",
+]
+partial_branches = [
+    "pragma: no branch",
 ]
 
 [tool.pylint.main]

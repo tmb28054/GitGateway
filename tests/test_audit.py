@@ -13,6 +13,7 @@ from gitgateway.audit import (
     audit,
     get_audit_log,
     get_user_audit_log,
+    list_all_events,
     log_event,
 )
 
@@ -257,6 +258,86 @@ class TestGetAuditLog:
         """Returns empty list for resource with no events."""
         events = get_audit_log("ghost/repo", dynamodb_resource=dynamodb)
         assert events == []
+
+
+class TestListAllEvents:
+    """Tests for list_all_events function."""
+
+    def test_lists_events_across_resources(self, dynamodb) -> None:
+        """Returns events from every resource, newest first."""
+        from unittest.mock import patch  # pylint: disable=import-outside-toplevel
+
+        with patch(
+            "gitgateway.audit._now_iso",
+            return_value="2025-01-01T00:00:00Z",
+        ):
+            log_event(
+                actor="alice", action="repo.created",
+                resource="team/app", dynamodb_resource=dynamodb,
+            )
+        with patch(
+            "gitgateway.audit._now_iso",
+            return_value="2025-06-01T00:00:00Z",
+        ):
+            log_event(
+                actor="bob", action="push",
+                resource="other/repo", dynamodb_resource=dynamodb,
+            )
+
+        events = list_all_events(dynamodb_resource=dynamodb)
+        assert len(events) == 2
+        # Newest first
+        assert events[0].actor == "bob"
+        assert events[1].actor == "alice"
+
+    def test_respects_limit(self, dynamodb) -> None:
+        """Caps the number of returned events."""
+        for i in range(5):
+            log_event(
+                actor=f"user{i}", action="push",
+                resource=f"team/repo{i}", dynamodb_resource=dynamodb,
+            )
+        events = list_all_events(limit=3, dynamodb_resource=dynamodb)
+        assert len(events) == 3
+
+    def test_empty(self, dynamodb) -> None:
+        """Returns empty list when no events exist."""
+        assert list_all_events(dynamodb_resource=dynamodb) == []
+
+    def test_paginates(self, dynamodb) -> None:
+        """Follows LastEvaluatedKey to gather all pages."""
+        from unittest.mock import MagicMock  # pylint: disable=import-outside-toplevel
+
+        fake_table = MagicMock()
+        fake_table.scan.side_effect = [
+            {
+                "Items": [
+                    {
+                        "event_id": "1", "timestamp": "2025-01-01T00:00:00Z",
+                        "actor": "a", "action": "x", "resource": "r",
+                        "details": "{}", "ip_address": "",
+                    },
+                ],
+                "LastEvaluatedKey": {"PK": "REPO#r", "SK": "EVENT#1"},
+            },
+            {
+                "Items": [
+                    {
+                        "event_id": "2", "timestamp": "2025-02-01T00:00:00Z",
+                        "actor": "b", "action": "y", "resource": "r",
+                        "details": "{}", "ip_address": "",
+                    },
+                ],
+            },
+        ]
+        fake_resource = MagicMock()
+        fake_resource.Table.return_value = fake_table
+
+        events = list_all_events(dynamodb_resource=fake_resource)
+        assert len(events) == 2
+        assert fake_table.scan.call_count == 2
+        # Newest first
+        assert events[0].actor == "b"
 
 
 class TestGetUserAuditLog:

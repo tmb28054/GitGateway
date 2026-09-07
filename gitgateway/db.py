@@ -339,24 +339,32 @@ def delete_repo(
             _get_table("prs", dynamodb_resource), pr_pk,
         )
     except Exception:  # pylint: disable=broad-except
-        pass
+        LOG.debug("Best-effort PR cleanup failed for %s", pr_pk, exc_info=True)
     try:
         _delete_all_items_with_pk(
             _get_table("comments", dynamodb_resource), pr_pk,
         )
     except Exception:  # pylint: disable=broad-except
-        pass
+        LOG.debug(
+            "Best-effort comment cleanup failed for %s", pr_pk, exc_info=True,
+        )
     try:
         _delete_items_with_pk_prefix(
             _get_table("status-checks", dynamodb_resource),
             f"PR#{group}/{name}",
         )
     except Exception:  # pylint: disable=broad-except
-        pass
+        LOG.debug(
+            "Best-effort status-check cleanup failed for %s/%s",
+            group, name, exc_info=True,
+        )
     try:
         _delete_items_with_pk_prefix(table, f"TREE#{group}/{name}")
     except Exception:  # pylint: disable=broad-except
-        pass
+        LOG.debug(
+            "Best-effort tree cleanup failed for %s/%s",
+            group, name, exc_info=True,
+        )
 
     LOG.info("Deleted repo and associated data: %s/%s", group, name)
 

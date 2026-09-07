@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gitgateway.ai import (
+    DEFAULT_MAX_CALLS_PER_HOUR,
+    DEFAULT_MODEL,
     AIConfig,
     AIError,
     _check_rate_limit,
@@ -32,8 +34,8 @@ class TestAIConfig:
     def test_defaults(self) -> None:
         """Default values are sensible."""
         config = AIConfig()
-        assert config.model == "gemini-pro"
-        assert config.max_calls_per_hour == 30
+        assert config.model == DEFAULT_MODEL
+        assert config.max_calls_per_hour == DEFAULT_MAX_CALLS_PER_HOUR
         assert config.enabled is True
 
 

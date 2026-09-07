@@ -11,10 +11,21 @@ class TestReadVersion:
 
     def test_reads_version_from_changelog(self) -> None:
         """Reads the first version entry from CHANGELOG.md."""
+        import re  # pylint: disable=import-outside-toplevel
+
         from gitgateway.__version__ import _read_version  # pylint: disable=import-outside-toplevel
 
+        # Derive the expected version from the changelog itself so this
+        # test does not go stale on every release.
+        changelog = (
+            Path(__file__).parent.parent / "CHANGELOG.md"
+        ).read_text(encoding="utf-8")
+        expected = re.search(
+            r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.MULTILINE,
+        ).group(1)
+
         version = _read_version()
-        assert version == "0.1.0"
+        assert version == expected
 
     def test_returns_fallback_when_no_changelog(self, tmp_path: Path) -> None:
         """Returns 0.0.0 when CHANGELOG.md does not exist."""
