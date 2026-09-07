@@ -2829,22 +2829,26 @@ class TestApiRoutingEdges:
         assert "Invalid level" in json.loads(resp.body)["error"]
 
     def test_get_access_with_group_filter(self, aws) -> None:
-        """GET /api/access?group=<name> takes the filtered-scan branch.
+        """GET /api/access?group=<name> returns the group's access entries.
 
         The handler builds a filtered ``table.scan`` when a ``group``
-        query parameter is present. DynamoDB rejects the raw ``resource``
-        attribute name (a reserved keyword), so the filtered scan raises;
-        this test drives that branch and asserts the resulting error.
+        query parameter is present. ``resource`` is a DynamoDB reserved
+        word, so the filter must alias it via ExpressionAttributeNames;
+        this test drives that branch and asserts the filtered result.
         """
-        from botocore.exceptions import ClientError
-
         _handle_api(_req("POST", "/api/access", {
             "username": "alice", "resource": "team", "level": "admin",
         }))
-        with pytest.raises(ClientError):
-            _handle_api(_req(
-                "GET", "/api/access", query_string="group=team",
-            ))
+        _handle_api(_req("POST", "/api/access", {
+            "username": "bob", "resource": "other", "level": "readonly",
+        }))
+        resp = _handle_api(_req(
+            "GET", "/api/access", query_string="group=team",
+        ))
+        assert resp.status_code == 200
+        entries = json.loads(resp.body)
+        resources = {e["resource"] for e in entries}
+        assert resources == {"team"}
 
 
 class TestGitAuthAndLfsEdges:

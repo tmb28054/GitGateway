@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-07
+
+### Fixed
+- `GET /api/access?group=<name>` raised a DynamoDB `ValidationException`
+  because the filter expression referenced the reserved word `resource`
+  directly; it now aliases it via `ExpressionAttributeNames`.
+- `audit.get_user_audit_log()` had the same latent issue with the reserved
+  word `actor` in its scan filter; it is now aliased as well.
+
 ## [0.2.1] - 2026-09-07
 
 ### Added

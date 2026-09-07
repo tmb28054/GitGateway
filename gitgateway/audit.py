@@ -283,8 +283,11 @@ def get_user_audit_log(
     """
     table = _get_table(dynamodb_resource)
 
+    # "actor" is a DynamoDB reserved word, so it must be referenced via
+    # an ExpressionAttributeNames alias.
     response = table.scan(
-        FilterExpression="actor = :actor",
+        FilterExpression="#actor = :actor",
+        ExpressionAttributeNames={"#actor": "actor"},
         ExpressionAttributeValues={":actor": username},
     )
 

@@ -1097,8 +1097,11 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
         import boto3  # pylint: disable=import-outside-toplevel
         table = boto3.resource("dynamodb").Table("gitgateway-access")
         if group_filter:
+            # "resource" is a DynamoDB reserved word, so it must be
+            # referenced via an ExpressionAttributeNames alias.
             response = table.scan(
-                FilterExpression="resource = :r",
+                FilterExpression="#res = :r",
+                ExpressionAttributeNames={"#res": "resource"},
                 ExpressionAttributeValues={":r": group_filter},
             )
         else:
