@@ -41,6 +41,14 @@ class BackupError(Exception):
     """Raised when a backup or restore operation fails."""
 
 
+class EmptyRepoError(BackupError):
+    """Raised when a repository has no refs to bundle.
+
+    An empty repository (freshly created, never pushed to) is not a
+    failure: it is skipped during archiving rather than aborting the run.
+    """
+
+
 @dataclass
 class RepoBackupResult:
     """Outcome of archiving a single repository.
@@ -164,7 +172,8 @@ def _create_bundle(local_path: Path, bundle_path: Path) -> list[str]:
         The list of ref names included in the bundle.
 
     Raises:
-        BackupError: If the repo has no refs or bundling fails.
+        EmptyRepoError: If the repo has no refs to bundle.
+        BackupError: If bundling fails.
     """
     from dulwich.repo import Repo as DulwichRepo  # pylint: disable=import-outside-toplevel
 
@@ -181,7 +190,7 @@ def _create_bundle(local_path: Path, bundle_path: Path) -> list[str]:
         if not r.startswith(b"refs/remotes/")
     )
     if not refs:
-        raise BackupError("Repository has no refs to bundle")
+        raise EmptyRepoError("Repository has no refs to bundle")
 
     try:
         subprocess.run(  # nosec B603 B607 - fixed args, trusted local path
@@ -265,6 +274,11 @@ def archive_repo(  # pylint: disable=too-many-locals,too-many-arguments,too-many
             lfs_bytes += int(head.get("ContentLength", 0))
         result.lfs_object_count = len(lfs_objects)
         result.lfs_bytes = lfs_bytes
+    except EmptyRepoError as exc:
+        # An empty repo is skipped, not failed, so it does not abort the run.
+        result.status = "empty"
+        result.error = str(exc)
+        LOG.info("Skipping empty repo %s/%s: %s", group, repo, exc)
     except Exception as exc:  # pylint: disable=broad-except
         result.status = "error"
         result.error = str(exc)
@@ -313,6 +327,7 @@ def archive_all(  # pylint: disable=too-many-locals,too-many-arguments,too-many-
             ))
 
     ok = [r for r in results if r.status == "ok"]
+    empty = [r for r in results if r.status == "empty"]
     failed = [r for r in results if r.status == "error"]
 
     manifest = {
@@ -322,6 +337,7 @@ def archive_all(  # pylint: disable=too-many-locals,too-many-arguments,too-many-
         "finished_at": _now_iso(),
         "repo_count": len(results),
         "ok_count": len(ok),
+        "empty_count": len(empty),
         "failed_count": len(failed),
         "repos": [r.to_dict() for r in results],
     }

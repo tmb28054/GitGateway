@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-09-06
+
+### Fixed
+- The nightly backup archived a repository with no refs (a freshly created,
+  never-pushed repo) as a hard failure, which failed the whole run and fired a
+  false SNS alert. Empty repositories are now skipped with a distinct `empty`
+  status (`EmptyRepoError`), recorded in the manifest as `empty_count`, and no
+  longer abort the archive job.
+
 ## [0.2.3] - 2026-09-06
 
 ### Added

@@ -88,11 +88,12 @@ def _run_archive() -> dict:
             "BACKUP_BUCKET", backup.DEFAULT_BACKUP_BUCKET,
         ),
     )
-    failed = [r for r in manifest.get("repos", []) if r.get("status") != "ok"]
+    repos = manifest.get("repos", [])
+    failed = [r for r in repos if r.get("status") == "error"]
+    empty = [r for r in repos if r.get("status") == "empty"]
     LOG.info(
-        "Archive complete: %d repos, %d failed, tiers=%s",
-        len(manifest.get("repos", [])), len(failed),
-        manifest.get("tiers", []),
+        "Archive complete: %d repos, %d empty (skipped), %d failed, tiers=%s",
+        len(repos), len(empty), len(failed), manifest.get("tiers", []),
     )
     if failed:
         names = ", ".join(f"{r['group']}/{r['repo']}" for r in failed)

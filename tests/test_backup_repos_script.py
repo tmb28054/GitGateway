@@ -101,6 +101,20 @@ class TestMain:
                           return_value={"repos": [], "tiers": []}):
             assert backup_repos.main() == 0
 
+    def test_archive_empty_repo_not_failure(self, monkeypatch) -> None:
+        """An 'empty' repo does not fail the archive job (exit 0)."""
+        monkeypatch.setenv("BACKUP_MODE", "archive")
+        manifest = {
+            "repos": [
+                {"group": "t", "repo": "a", "status": "ok"},
+                {"group": "t", "repo": "fresh", "status": "empty"},
+            ],
+            "tiers": ["daily"],
+        }
+        with patch.object(backup_repos.backup, "archive_all",
+                          return_value=manifest):
+            assert backup_repos.main() == 0
+
     def test_archive_failure_alerts(self, monkeypatch) -> None:
         """A failed repo makes archive raise, return 1, and alert."""
         monkeypatch.setenv("BACKUP_MODE", "archive")

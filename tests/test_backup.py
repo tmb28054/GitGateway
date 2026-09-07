@@ -61,6 +61,21 @@ def _make_bare_repo_in_s3(
     )
 
 
+def _make_empty_bare_repo_in_s3(s3, tmp_path: Path, group: str,
+                                repo: str) -> None:
+    """Create a bare repo with no commits/refs and sync it to S3."""
+    from gitgateway import storage
+
+    bare = tmp_path / f"{group}-{repo}-empty.git"
+    subprocess.run(  # nosec B603 B607
+        ["git", "init", "-q", "--bare", "-b", "main", str(bare)],
+        check=True, capture_output=True,
+    )
+    storage.sync_repo_to_s3(
+        bare, group, repo, bucket=REPO_BUCKET, s3_client=s3,
+    )
+
+
 @pytest.fixture
 def aws():
     """Provision the three S3 buckets + the repos DynamoDB table."""
@@ -115,12 +130,12 @@ class TestCreateBundle:
     """Tests for the _create_bundle helper's edge cases."""
 
     def test_no_refs_raises(self, tmp_path) -> None:
-        """A repo with no refs raises BackupError."""
+        """A repo with no refs raises EmptyRepoError (a BackupError)."""
         from dulwich.repo import Repo as DulwichRepo
 
         bare = tmp_path / "empty.git"
         DulwichRepo.init_bare(str(bare), mkdir=True)
-        with pytest.raises(backup.BackupError, match="no refs"):
+        with pytest.raises(backup.EmptyRepoError, match="no refs"):
             backup._create_bundle(bare, tmp_path / "out.bundle")
 
     def test_git_bundle_failure_raises(self, tmp_path) -> None:
@@ -224,6 +239,24 @@ class TestArchiveRepo:
         assert result.status == "error"
         assert result.error
 
+    def test_empty_repo_returns_empty_status(self, aws, tmp_path) -> None:
+        """A repo with no refs is skipped with status 'empty', not error."""
+        _make_empty_bare_repo_in_s3(aws["s3"], tmp_path, "team", "fresh")
+        result = backup.archive_repo(
+            "team", "fresh", ["daily"], "2026-09-09",
+            repo_bucket=REPO_BUCKET, lfs_bucket=LFS_BUCKET,
+            backup_bucket=BACKUP_BUCKET,
+            local_base=tmp_path / "arch", s3_client=aws["s3"],
+        )
+        assert result.status == "empty"
+        assert "no refs" in result.error
+        # No bundle was written for an empty repo.
+        with pytest.raises(Exception):
+            aws["s3"].head_object(
+                Bucket=BACKUP_BUCKET,
+                Key="daily/2026-09-09/team/fresh.bundle",
+            )
+
 
 class TestArchiveAll:
     """Tests for archive_all."""
@@ -264,6 +297,22 @@ class TestArchiveAll:
         )
         assert manifest["failed_count"] == 1
         assert manifest["repos"][0]["status"] == "error"
+
+    def test_manifest_records_empty(self, aws, tmp_path) -> None:
+        """An empty repo is counted as 'empty', not 'failed'."""
+        db.create_group(Group(name="team"), aws["ddb"])
+        db.create_repo(Repo(group="team", name="fresh"), aws["ddb"])
+        _make_empty_bare_repo_in_s3(aws["s3"], tmp_path, "team", "fresh")
+
+        manifest = backup.archive_all(
+            today=date(2026, 9, 9),
+            repo_bucket=REPO_BUCKET, lfs_bucket=LFS_BUCKET,
+            backup_bucket=BACKUP_BUCKET, local_base=tmp_path / "arch",
+            s3_client=aws["s3"], dynamodb_resource=aws["ddb"],
+        )
+        assert manifest["failed_count"] == 0
+        assert manifest["empty_count"] == 1
+        assert manifest["repos"][0]["status"] == "empty"
 
 
 class TestListAndReadManifest:
