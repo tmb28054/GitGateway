@@ -52,6 +52,18 @@ Parameters:
     Type: String
     Default: ''
     Description: ARN of the binary tools Lambda layer
+  AlertEmail:
+    Type: String
+    Default: topaz@topazhome.net
+    Description: Email address subscribed to backup failure alerts
+  BackupSourceKey:
+    Type: String
+    Default: codebuild/backup.zip
+    Description: S3 key (in the repos bucket) of the backup CodeBuild source zip
+  BackupScheduleExpression:
+    Type: String
+    Default: cron(0 5 * * ? *)
+    Description: EventBridge schedule for the nightly backup (UTC)
 
 Conditions:
   HasCoreLayer: !Not [!Equals [!Ref CoreLayerArn, '']]
@@ -80,6 +92,43 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: aws:kms
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${StackNamePrefix}-backups'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Tiered retention: daily 30d, weekly 52w (~364d), monthly 36mo (~1095d).
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-daily
+            Status: Enabled
+            Prefix: daily/
+            ExpirationInDays: 30
+          - Id: expire-weekly
+            Status: Enabled
+            Prefix: weekly/
+            ExpirationInDays: 364
+          - Id: expire-monthly
+            Status: Enabled
+            Prefix: monthly/
+            ExpirationInDays: 1095
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${StackNamePrefix}-alerts'
+      DisplayName: GitGateway Alerts
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
 
   ReposTable:
     Type: AWS::DynamoDB::Table
@@ -267,6 +316,8 @@ Resources:
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-repos/*'
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-lfs'
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-lfs/*'
+                  - !Sub 'arn:aws:s3:::${StackNamePrefix}-backups'
+                  - !Sub 'arn:aws:s3:::${StackNamePrefix}-backups/*'
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
@@ -279,6 +330,16 @@ Resources:
                   - lambda:InvokeFunction
                 Resource:
                   - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StackNamePrefix}-handler'
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BackupProject.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref AlertsTopic
 
   ApiHandler:
     Type: AWS::Lambda::Function
@@ -305,6 +366,13 @@ Resources:
           STACK_NAME_PREFIX: !Ref StackNamePrefix
           DOMAIN_NAME: !Ref DomainName
           IDP_URL: !Ref IdpUrl
+          REPO_BUCKET: !Ref RepoBucket
+          LFS_BUCKET: !Ref LfsBucket
+          BACKUP_BUCKET: !Ref BackupBucket
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          BACKUP_CODEBUILD_PROJECT: !Ref BackupProject
+          BACKUP_SOURCE_BUCKET: !Ref RepoBucket
+          BACKUP_SOURCE_KEY: !Ref BackupSourceKey
 
   ApiHandlerPermission:
     Type: AWS::Lambda::Permission
@@ -365,6 +433,120 @@ Resources:
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
 
+  BackupProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackNamePrefix}-backup-build-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${StackNamePrefix}-backup-build-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackNamePrefix}-backup'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${StackNamePrefix}-backup:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${StackNamePrefix}-repos'
+                  - !Sub 'arn:aws:s3:::${StackNamePrefix}-repos/*'
+                  - !Sub 'arn:aws:s3:::${StackNamePrefix}-lfs'
+                  - !Sub 'arn:aws:s3:::${StackNamePrefix}-lfs/*'
+                  - !Sub 'arn:aws:s3:::${StackNamePrefix}-backups'
+                  - !Sub 'arn:aws:s3:::${StackNamePrefix}-backups/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackNamePrefix}-*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref AlertsTopic
+
+  BackupProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${StackNamePrefix}-backup'
+      Description: Nightly Tier-2 backup and on-demand restore of repositories
+      ServiceRole: !GetAtt BackupProjectRole.Arn
+      TimeoutInMinutes: 480
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: BACKUP_MODE
+            Value: archive
+          - Name: REPO_BUCKET
+            Value: !Ref RepoBucket
+          - Name: LFS_BUCKET
+            Value: !Ref LfsBucket
+          - Name: BACKUP_BUCKET
+            Value: !Ref BackupBucket
+          - Name: ALERTS_TOPIC_ARN
+            Value: !Ref AlertsTopic
+      Source:
+        Type: S3
+        Location: !Sub '${StackNamePrefix}-repos/${BackupSourceKey}'
+        BuildSpec: scripts/buildspec_backup.yaml
+
+  BackupScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackNamePrefix}-backup-schedule-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${StackNamePrefix}-backup-schedule-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BackupProject.Arn
+
+  BackupScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${StackNamePrefix}-nightly-backup'
+      Description: Triggers the nightly repository backup
+      ScheduleExpression: !Ref BackupScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: BackupProjectTarget
+          Arn: !GetAtt BackupProject.Arn
+          RoleArn: !GetAtt BackupScheduleRole.Arn
+
 Outputs:
   ApiUrl:
     Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
@@ -376,5 +558,11 @@ Outputs:
     Value: !Ref RepoBucket
   LfsBucketName:
     Value: !Ref LfsBucket
+  BackupBucketName:
+    Value: !Ref BackupBucket
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+  BackupProjectName:
+    Value: !Ref BackupProject
   LambdaFunctionName:
     Value: !Ref ApiHandler

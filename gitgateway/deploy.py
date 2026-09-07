@@ -24,6 +24,20 @@ LOG = logging.getLogger(__name__)
 
 TEMPLATE_PATH = Path(__file__).parent / "template.yaml"
 PACKAGE_DIR = Path(__file__).parent
+PROJECT_ROOT = Path(__file__).parent.parent
+
+# S3 key (in the repos bucket) for the backup CodeBuild source zip.
+BACKUP_SOURCE_KEY = "codebuild/backup.zip"
+
+# Project files the backup CodeBuild source needs so ``pip install .`` and
+# ``python scripts/backup_repos.py`` both work inside the build container.
+BACKUP_SOURCE_INCLUDES = [
+    "gitgateway",
+    "scripts",
+    "pyproject.toml",
+    "README.md",
+    "CHANGELOG.md",
+]
 
 OUTPUT_KEY_MAP = {
     "ApiUrl": "api_url",
@@ -31,6 +45,9 @@ OUTPUT_KEY_MAP = {
     "CustomDomainUrl": "domain_url",
     "RepoBucketName": "repo_bucket",
     "LfsBucketName": "lfs_bucket",
+    "BackupBucketName": "backup_bucket",
+    "AlertsTopicArn": "alerts_topic_arn",
+    "BackupProjectName": "backup_project",
     "LambdaFunctionName": "lambda_function",
 }
 
@@ -151,6 +168,76 @@ def package_lambda(output_dir: Path | None = None) -> Path:
 
     LOG.info("Lambda package created: %s (%d bytes)", zip_path, zip_path.stat().st_size)
     return zip_path
+
+
+def package_backup_source(output_dir: Path | None = None) -> Path:
+    """Package the backup CodeBuild source into a ZIP.
+
+    Bundles the project files (``gitgateway/``, ``scripts/``,
+    ``pyproject.toml``, ``README.md``, ``CHANGELOG.md``) so the backup
+    build can ``pip install .`` and run ``scripts/backup_repos.py``.
+
+    Args:
+        output_dir: Directory to write the ZIP to. Defaults to a tempdir.
+
+    Returns:
+        Path to the created ZIP file.
+    """
+    if output_dir is None:
+        output_dir = Path(tempfile.mkdtemp())
+
+    zip_path = output_dir / "backup-source.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for include in BACKUP_SOURCE_INCLUDES:
+            src = PROJECT_ROOT / include
+            if src.is_dir():
+                for root, _dirs, files in os.walk(src):
+                    if "__pycache__" in root:
+                        continue
+                    for filename in files:
+                        file_path = Path(root) / filename
+                        arcname = file_path.relative_to(PROJECT_ROOT)
+                        zf.write(file_path, arcname)
+            elif src.exists():
+                zf.write(src, src.relative_to(PROJECT_ROOT))
+
+    LOG.info(
+        "Backup source package created: %s (%d bytes)",
+        zip_path, zip_path.stat().st_size,
+    )
+    return zip_path
+
+
+def upload_backup_source(
+    zip_path: Path,
+    bucket: str,
+    session: object,
+    s3_key: str = BACKUP_SOURCE_KEY,
+) -> str:
+    """Upload the backup CodeBuild source ZIP to S3.
+
+    Args:
+        zip_path: Path to the ZIP file.
+        bucket: S3 bucket name (the repos bucket).
+        session: boto3 Session.
+        s3_key: Destination S3 key.
+
+    Returns:
+        The S3 key where the package was uploaded.
+
+    Raises:
+        DeployError: If upload fails.
+    """
+    s3_client = session.client("s3")
+    try:
+        s3_client.upload_file(str(zip_path), bucket, s3_key)
+    except Exception as exc:
+        raise DeployError(
+            f"Failed to upload backup source: {exc}",
+        ) from exc
+
+    LOG.info("Backup source uploaded: s3://%s/%s", bucket, s3_key)
+    return s3_key
 
 
 def _package_layer(
@@ -541,6 +628,12 @@ def deploy_stack(  # pylint: disable=too-many-positional-arguments,too-many-loca
     zip_path = package_lambda(output_dir)
     s3_key = upload_lambda_package(zip_path, code_bucket, session)
 
+    # Package and upload the backup CodeBuild source (used by the nightly
+    # backup + on-demand restore CodeBuild project).
+    LOG.info("Packaging backup CodeBuild source...")
+    backup_zip = package_backup_source(output_dir)
+    backup_source_key = upload_backup_source(backup_zip, code_bucket, session)
+
     # Build and publish layers
     LOG.info("Packaging core layer...")
     core_layer_zip = _package_layer(CORE_LAYER_DEPS, output_dir, "core")
@@ -571,6 +664,7 @@ def deploy_stack(  # pylint: disable=too-many-positional-arguments,too-many-loca
         core_layer_arn=core_layer_arn,
         linting_layer_arn=linting_layer_arn,
         binaries_layer_arn=binaries_layer_arn,
+        backup_source_key=backup_source_key,
     )
 
     kwargs = {
@@ -699,6 +793,7 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
     core_layer_arn: str = "",
     linting_layer_arn: str = "",
     binaries_layer_arn: str = "",
+    backup_source_key: str = BACKUP_SOURCE_KEY,
 ) -> list[dict]:
     """Build CloudFormation parameters list.
 
@@ -713,6 +808,7 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
         core_layer_arn: ARN of the core dependencies layer.
         linting_layer_arn: ARN of the linting dependencies layer.
         binaries_layer_arn: ARN of the binary tools layer.
+        backup_source_key: S3 key of the backup CodeBuild source zip.
 
     Returns:
         List of parameter dicts for CloudFormation.
@@ -754,6 +850,10 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
         {
             "ParameterKey": "BinariesLayerArn",
             "ParameterValue": binaries_layer_arn,
+        },
+        {
+            "ParameterKey": "BackupSourceKey",
+            "ParameterValue": backup_source_key,
         },
     ]
 

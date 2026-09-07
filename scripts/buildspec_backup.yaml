@@ -1,0 +1,27 @@
+# yamllint disable rule:line-length
+# CodeBuild buildspec for GitGateway Tier-2 backups and restore.
+#
+# The source zip (uploaded to s3://<repo-bucket>/codebuild/backup.zip by
+# gitgateway.deploy) contains the whole project, so `pip install .` brings
+# in gitgateway plus its runtime deps (boto3, dulwich). git is required for
+# `git bundle`; the standard aws/codebuild/standard image ships it.
+#
+# Behaviour is driven entirely by environment variables set on the build
+# (see scripts/backup_repos.py): BACKUP_MODE, REPO_BUCKET, LFS_BUCKET,
+# BACKUP_BUCKET, ALERTS_TOPIC_ARN, and (restore only) RESTORE_TIER,
+# RESTORE_SNAPSHOT, RESTORE_REPOS.
+---
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - git --version
+      - pip install --quiet --upgrade pip
+      - pip install --quiet .
+  build:
+    commands:
+      - echo "Running GitGateway backup job (mode=${BACKUP_MODE:-archive})"
+      - python scripts/backup_repos.py

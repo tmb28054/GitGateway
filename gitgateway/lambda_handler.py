@@ -1049,6 +1049,29 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
                 headers=headers,
             )
 
+    # GET /api/admin/backups — list snapshots (admin only)
+    if path == "/api/admin/backups" and method == "GET":
+        denied = _require_admin(request, headers)
+        if denied is not None:
+            return denied
+        return _api_list_backups(headers)
+
+    # GET /api/admin/backups/<tier>/<snapshot> — read a snapshot manifest
+    if path.startswith("/api/admin/backups/") and method == "GET":
+        denied = _require_admin(request, headers)
+        if denied is not None:
+            return denied
+        return _api_read_backup_manifest(
+            path[len("/api/admin/backups/"):], headers,
+        )
+
+    # POST /api/admin/restore — trigger a restore build (admin only)
+    if path == "/api/admin/restore" and method == "POST":
+        denied = _require_admin(request, headers)
+        if denied is not None:
+            return denied
+        return _api_trigger_restore(request, headers)
+
     # POST /api/access — grant access
     if path == "/api/access" and method == "POST":
         try:
@@ -1161,6 +1184,205 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
         body=json.dumps({"error": "Not found", "path": path}),
         headers=headers,
     )
+
+
+def _require_admin(request: Request, headers: dict) -> Response | None:
+    """Return a 403 Response unless the caller is an admin.
+
+    Args:
+        request: The normalized request.
+        headers: Response headers (JSON + CORS) to reuse.
+
+    Returns:
+        None if the caller is an admin, otherwise a 403 Response.
+    """
+    if _get_session_user(request).get("is_admin"):
+        return None
+    return Response(
+        status_code=403,
+        body=json.dumps({"error": "Admin access required"}),
+        headers=headers,
+    )
+
+
+def _api_list_backups(headers: dict) -> Response:
+    """List available backup snapshots across all tiers.
+
+    Args:
+        headers: Response headers (JSON + CORS).
+
+    Returns:
+        A JSON Response with the list of snapshots.
+    """
+    from gitgateway import backup  # pylint: disable=import-outside-toplevel
+
+    backup_bucket = _os_environ().get(
+        "BACKUP_BUCKET", backup.DEFAULT_BACKUP_BUCKET,
+    )
+    try:
+        snapshots = backup.list_snapshots(backup_bucket=backup_bucket)
+    except Exception as exc:  # pylint: disable=broad-except
+        LOG.exception("Failed to list backup snapshots")
+        return Response(
+            status_code=500,
+            body=json.dumps({"error": f"Failed to list backups: {exc}"}),
+            headers=headers,
+        )
+    return Response(
+        status_code=200,
+        body=json.dumps(snapshots),
+        headers=headers,
+    )
+
+
+def _api_read_backup_manifest(suffix: str, headers: dict) -> Response:
+    """Read a single snapshot manifest.
+
+    Args:
+        suffix: The path suffix after ``/api/admin/backups/``, expected to
+            be ``<tier>/<snapshot>``.
+        headers: Response headers (JSON + CORS).
+
+    Returns:
+        A JSON Response with the manifest, 400 on a malformed path, or 404
+        when the manifest cannot be read.
+    """
+    from gitgateway import backup  # pylint: disable=import-outside-toplevel
+
+    parts = [p for p in suffix.split("/") if p]
+    if len(parts) != 2:
+        return Response(
+            status_code=400,
+            body=json.dumps({"error": "Expected /<tier>/<snapshot>"}),
+            headers=headers,
+        )
+    tier, snapshot = parts
+    backup_bucket = _os_environ().get(
+        "BACKUP_BUCKET", backup.DEFAULT_BACKUP_BUCKET,
+    )
+    try:
+        manifest = backup.read_manifest(
+            tier, snapshot, backup_bucket=backup_bucket,
+        )
+    except backup.BackupError as exc:
+        return Response(
+            status_code=404,
+            body=json.dumps({"error": str(exc)}),
+            headers=headers,
+        )
+    return Response(
+        status_code=200,
+        body=json.dumps(manifest),
+        headers=headers,
+    )
+
+
+def _api_trigger_restore(request: Request, headers: dict) -> Response:
+    """Trigger an asynchronous restore CodeBuild job.
+
+    Reads ``tier``, ``snapshot``, and ``repos`` from the JSON body, starts
+    the backup CodeBuild project in restore mode, records an audit event,
+    and returns the build id.
+
+    Args:
+        request: The normalized request.
+        headers: Response headers (JSON + CORS).
+
+    Returns:
+        A JSON Response: 202 with the build id, 400 on bad input, or 500
+        when the build cannot be started.
+    """
+    from gitgateway import (  # pylint: disable=import-outside-toplevel
+        backup,
+        codebuild,
+    )
+    from gitgateway.audit import (  # pylint: disable=import-outside-toplevel
+        log_event,
+    )
+
+    try:
+        body = json.loads(request.body.decode()) if request.body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return Response(
+            status_code=400,
+            body=json.dumps({"error": "Invalid JSON body"}),
+            headers=headers,
+        )
+
+    tier = body.get("tier", "")
+    snapshot = body.get("snapshot", "")
+    repos = body.get("repos", "")
+    if not tier or not snapshot or not repos:
+        return Response(
+            status_code=400,
+            body=json.dumps(
+                {"error": "tier, snapshot, and repos are required"},
+            ),
+            headers=headers,
+        )
+
+    env = _os_environ()
+    project = env.get("BACKUP_CODEBUILD_PROJECT", "gitgateway-backup")
+    source_bucket = env.get(
+        "BACKUP_SOURCE_BUCKET", env.get("REPO_BUCKET", "gitgateway-repos"),
+    )
+    source_key = env.get("BACKUP_SOURCE_KEY", "codebuild/backup.zip")
+    build_env = {
+        "BACKUP_MODE": "restore",
+        "RESTORE_TIER": tier,
+        "RESTORE_SNAPSHOT": snapshot,
+        "RESTORE_REPOS": json.dumps(repos),
+        "REPO_BUCKET": env.get("REPO_BUCKET", "gitgateway-repos"),
+        "LFS_BUCKET": env.get("LFS_BUCKET", "gitgateway-lfs"),
+        "BACKUP_BUCKET": env.get(
+            "BACKUP_BUCKET", backup.DEFAULT_BACKUP_BUCKET,
+        ),
+        "ALERTS_TOPIC_ARN": env.get("ALERTS_TOPIC_ARN", ""),
+    }
+
+    buildspec = env.get("BACKUP_BUILDSPEC", "scripts/buildspec_backup.yaml")
+    try:
+        build_id = codebuild.start_build(
+            project, source_bucket, source_key,
+            environment_variables=build_env,
+            buildspec_override=buildspec,
+        )
+    except codebuild.CodeBuildError as exc:
+        return Response(
+            status_code=500,
+            body=json.dumps({"error": f"Failed to start restore: {exc}"}),
+            headers=headers,
+        )
+
+    actor = _get_session_user(request).get("username", "unknown")
+    try:
+        log_event(
+            actor=actor,
+            action="backup.restore",
+            resource=f"{tier}/{snapshot}",
+            details={"repos": repos, "build_id": build_id},
+            ip_address=request.source_ip,
+        )
+    except Exception:  # pylint: disable=broad-except
+        # Audit failures must not block the restore from being reported.
+        LOG.exception("Failed to record restore audit event")
+
+    return Response(
+        status_code=202,
+        body=json.dumps({"message": "Restore started", "build_id": build_id}),
+        headers=headers,
+    )
+
+
+def _os_environ() -> object:
+    """Return ``os.environ`` (indirection keeps imports local & testable).
+
+    Returns:
+        The process environment mapping.
+    """
+    import os  # pylint: disable=import-outside-toplevel
+
+    return os.environ
 
 
 def _get_session_user(request: Request) -> dict:
@@ -4092,6 +4314,9 @@ def _get_admin_content(path: str) -> str:
           <li style="padding:0.5rem 0;">
             <a href="/admin/audit">Audit Log</a>
           </li>
+          <li style="padding:0.5rem 0;">
+            <a href="/admin/backups">Backups &amp; Restore</a>
+          </li>
         </ul>"""
 
     if path == "/admin/groups":
@@ -4105,6 +4330,9 @@ def _get_admin_content(path: str) -> str:
 
     if path == "/admin/audit":
         return _render_admin_audit_page()
+
+    if path == "/admin/backups":
+        return _render_admin_backups_page()
 
     return f"<h1>Admin</h1><p>Path: {path}</p>"
 
@@ -4204,6 +4432,151 @@ def _render_admin_audit_page() -> str:
         const text = row.textContent.toLowerCase();
         row.style.display = text.indexOf(q) === -1 ? 'none' : '';
       }});
+    }}
+    </script>"""
+
+
+def _render_admin_backups_page() -> str:
+    """Render the admin backups & restore page with live data.
+
+    Lists available snapshots across all tiers (newest first) and offers
+    a restore form that triggers an asynchronous CodeBuild restore into a
+    new repository name via ``POST /api/admin/restore``.
+
+    Returns:
+        HTML content for the backups page.
+    """
+    import html  # pylint: disable=import-outside-toplevel
+
+    from gitgateway import backup  # pylint: disable=import-outside-toplevel
+
+    backup_bucket = _os_environ().get(
+        "BACKUP_BUCKET", backup.DEFAULT_BACKUP_BUCKET,
+    )
+    try:
+        snapshots = backup.list_snapshots(backup_bucket=backup_bucket)
+        error = ""
+    except Exception:  # pylint: disable=broad-except
+        snapshots = []
+        error = "Could not load backup snapshots."
+        LOG.exception("Failed to load backup snapshots")
+
+    rows = ""
+    options = ""
+    for snap in snapshots:
+        tier = snap.get("tier", "")
+        name = snap.get("snapshot", "")
+        rows += f"""<tr style="border-bottom:1px solid #f0f0f0;">
+          <td style="padding:0.5rem;">
+            <code style="background:#f6f8fa;padding:0.1rem 0.4rem;
+            border-radius:3px;font-size:0.85rem;">{html.escape(tier)}</code>
+          </td>
+          <td style="padding:0.5rem;font-weight:600;">
+            {html.escape(name)}</td>
+          <td style="padding:0.5rem;">
+            <a href="/api/admin/backups/{html.escape(tier)}/{html.escape(name)}"
+              target="_blank">View manifest</a></td>
+        </tr>"""
+        label = f"{tier} / {name}"
+        options += (
+            f'<option value="{html.escape(tier)}|{html.escape(name)}">'
+            f'{html.escape(label)}</option>'
+        )
+
+    if not rows:
+        rows = """<tr><td colspan="3" style="padding:1.5rem;color:#586069;
+          text-align:center;">No snapshots available yet.</td></tr>"""
+
+    error_banner = ""
+    if error:
+        error_banner = f"""<div style="margin:1rem 0;padding:0.75rem 1rem;
+          background:#ffeef0;border:1px solid #f9c0c0;border-radius:6px;
+          color:#cb2431;">{html.escape(error)}</div>"""
+
+    count_label = (
+        f"{len(snapshots)} snapshot{'s' if len(snapshots) != 1 else ''}"
+    )
+
+    return f"""
+    <h1>Backups &amp; Restore</h1>
+    <p style="color:#586069;margin-top:0.25rem;">
+      Nightly snapshots of every repository (git bundle + LFS objects),
+      retained across daily, weekly, and monthly tiers.
+      Showing {count_label}.</p>
+    {error_banner}
+
+    <table style="width:100%;border-collapse:collapse;margin-top:1rem;">
+      <thead>
+        <tr style="border-bottom:2px solid #e1e4e8;">
+          <th style="text-align:left;padding:0.5rem;">Tier</th>
+          <th style="text-align:left;padding:0.5rem;">Snapshot</th>
+          <th style="text-align:left;padding:0.5rem;">Manifest</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+
+    <h2 style="margin-top:2rem;">Restore</h2>
+    <p style="color:#586069;">
+      Restores never overwrite the source. Each repository is restored into
+      a new name. Leave the target blank to auto-generate one.</p>
+
+    <div style="max-width:640px;padding:1rem;border:1px solid #e1e4e8;
+      border-radius:6px;">
+      <label style="display:block;margin-bottom:0.5rem;">
+        Snapshot
+        <select id="restore-snapshot" style="width:100%;padding:0.4rem;
+          margin-top:0.25rem;border:1px solid #d1d5da;border-radius:4px;">
+          {options}
+        </select>
+      </label>
+      <label style="display:block;margin-bottom:0.5rem;">
+        Repositories
+        <input type="text" id="restore-repos"
+          placeholder='all, or JSON: [{{"group":"team","repo":"app"}}]'
+          style="width:100%;box-sizing:border-box;padding:0.4rem;
+          margin-top:0.25rem;border:1px solid #d1d5da;border-radius:4px;">
+      </label>
+      <button onclick="startRestore()"
+        style="margin-top:0.5rem;background:#2ea44f;color:#fff;border:none;
+        padding:0.5rem 1rem;border-radius:6px;cursor:pointer;">
+        Start Restore</button>
+      <div id="restore-status" style="margin-top:0.75rem;color:#586069;">
+      </div>
+    </div>
+
+    <script>
+    async function startRestore() {{
+      const status = document.getElementById('restore-status');
+      const sel = document.getElementById('restore-snapshot').value;
+      if (!sel) {{ status.textContent = 'Select a snapshot first.'; return; }}
+      const parts = sel.split('|');
+      const raw = document.getElementById('restore-repos').value.trim();
+      if (!raw) {{ status.textContent = 'Enter repositories to restore.';
+        return; }}
+      let repos;
+      if (raw === 'all') {{ repos = 'all'; }}
+      else {{
+        try {{ repos = JSON.parse(raw); }}
+        catch (e) {{ status.textContent = 'Invalid repositories JSON.';
+          return; }}
+      }}
+      status.textContent = 'Starting restore...';
+      const resp = await fetch('/api/admin/restore', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{tier: parts[0], snapshot: parts[1],
+          repos: repos}}),
+      }});
+      const data = await resp.json();
+      if (resp.status === 202) {{
+        status.textContent = 'Restore started (build ' +
+          (data.build_id || '?') + ').';
+      }} else {{
+        status.textContent = 'Error: ' + (data.error || resp.status);
+      }}
     }}
     </script>"""
 

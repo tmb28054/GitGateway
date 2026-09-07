@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-06
+
+### Added
+- Tier-2 repository backups & restore. A nightly CodeBuild job bundles every
+  registered repository (`git bundle --all`) plus its Git LFS objects into a
+  separate `gitgateway-backups` bucket, writing a per-snapshot `manifest.json`.
+  Snapshots are organized into tiered prefixes (`daily/`, `weekly/`,
+  `monthly/`) with S3 lifecycle retention of 30 days, 52 weeks, and 36 months
+  respectively.
+- `gitgateway/backup.py` module: `archive_all`/`archive_repo`, `list_snapshots`,
+  `read_manifest`, and `restore_repo`/`restore_repos`. Restores always create a
+  new repository name and never overwrite the source; a single repo, an
+  explicit list, or `all` repos in a snapshot can be restored.
+- `scripts/backup_repos.py` CodeBuild entry point (archive/restore modes driven
+  by environment variables) and `scripts/buildspec_backup.yaml`.
+- Admin API routes gated on admin access: `GET /api/admin/backups` (list
+  snapshots), `GET /api/admin/backups/<tier>/<snapshot>` (read manifest), and
+  `POST /api/admin/restore` (trigger an async restore CodeBuild job, audited as
+  `backup.restore`).
+- Admin console page at `/admin/backups` listing snapshots with a restore form.
+- SNS alerting: a `gitgateway-alerts` topic with an email subscription; the
+  backup job publishes to it on failure.
+- CloudFormation resources for the above (backup bucket + lifecycle, SNS topic
+  + subscription, CodeBuild project, nightly EventBridge schedule, and IAM),
+  plus wiring in `deploy.py` to package and upload the backup CodeBuild source.
+
 ## [0.2.2] - 2026-09-07
 
 ### Fixed

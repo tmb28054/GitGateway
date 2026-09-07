@@ -319,7 +319,9 @@ from gitgateway.deploy import (
     _package_binary_layer,
     _package_layer,
     _publish_layer,
+    package_backup_source,
     package_lambda,
+    upload_backup_source,
     upload_lambda_package,
 )
 
@@ -657,3 +659,72 @@ class TestUploadLambdaPackage:
         )
         with pytest.raises(DeployError, match="Failed to upload"):
             upload_lambda_package(zip_path, "code", session)
+
+
+class TestPackageBackupSource:
+    """Tests for package_backup_source and upload_backup_source."""
+
+    @staticmethod
+    def _fake_project(root: Path) -> None:
+        """Build a small fake project tree under root."""
+        pkg = root / "gitgateway"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        cache = pkg / "__pycache__"
+        cache.mkdir()
+        (cache / "x.pyc").write_text("bytecode")
+        (root / "pyproject.toml").write_text("[project]\nname='x'\n")
+        # A listed include that does not exist is skipped silently.
+
+    def test_creates_zip_with_dirs_and_files(self, tmp_path: Path) -> None:
+        """Bundles dirs (skipping __pycache__) and single files."""
+        root = tmp_path / "proj"
+        root.mkdir()
+        self._fake_project(root)
+        out = tmp_path / "out"
+        out.mkdir()
+        with patch("gitgateway.deploy.PROJECT_ROOT", root), patch(
+            "gitgateway.deploy.BACKUP_SOURCE_INCLUDES",
+            ["gitgateway", "pyproject.toml", "does-not-exist"],
+        ):
+            zip_path = package_backup_source(out)
+        assert zip_path.exists()
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+        assert "gitgateway/__init__.py" in names
+        assert "pyproject.toml" in names
+        # __pycache__ contents are excluded.
+        assert not any("__pycache__" in n for n in names)
+
+    def test_default_output_dir(self, tmp_path: Path) -> None:
+        """Uses a temp dir when no output dir is given."""
+        root = tmp_path / "proj"
+        root.mkdir()
+        self._fake_project(root)
+        out = tmp_path / "out"
+        out.mkdir()
+        with patch("gitgateway.deploy.PROJECT_ROOT", root), patch(
+            "gitgateway.deploy.BACKUP_SOURCE_INCLUDES", ["pyproject.toml"],
+        ), patch("tempfile.mkdtemp", return_value=str(out)):
+            zip_path = package_backup_source()
+        assert zip_path.exists()
+
+    def test_upload_success(self, tmp_path: Path) -> None:
+        """Uploads the source zip and returns the key."""
+        zip_path = tmp_path / "backup-source.zip"
+        zip_path.write_bytes(b"z")
+        session = MagicMock()
+        key = upload_backup_source(zip_path, "code", session, s3_key="k.zip")
+        assert key == "k.zip"
+        session.client.return_value.upload_file.assert_called_once()
+
+    def test_upload_failure_raises(self, tmp_path: Path) -> None:
+        """An upload failure raises DeployError."""
+        zip_path = tmp_path / "backup-source.zip"
+        zip_path.write_bytes(b"z")
+        session = MagicMock()
+        session.client.return_value.upload_file.side_effect = RuntimeError(
+            "s3 down",
+        )
+        with pytest.raises(DeployError, match="Failed to upload backup"):
+            upload_backup_source(zip_path, "code", session)

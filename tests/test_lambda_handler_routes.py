@@ -3594,3 +3594,238 @@ class TestPageRoutingFalseLegs:
         """/groups/<x>/tree/<branch> with no repo falls through."""
         html = _get_page_content("/groups/solo/tree/main", self._info())
         assert "Path:" in html
+
+
+class TestApiAdminBackups:
+    """Tests for the admin backup/restore API routes."""
+
+    @staticmethod
+    def _admin_headers(username: str = "root") -> dict:
+        """Build headers with an admin session cookie."""
+        from gitgateway.auth import (  # pylint: disable=import-outside-toplevel
+            AuthenticatedUser,
+            create_session_cookie,
+        )
+
+        cookie = create_session_cookie(
+            AuthenticatedUser(username=username, is_admin=True),
+            "gitgateway-session-secret",
+        )
+        return {"cookie": f"session={cookie}"}
+
+    @staticmethod
+    def _user_headers(username: str = "alice") -> dict:
+        """Build headers with a non-admin session cookie."""
+        from gitgateway.auth import (  # pylint: disable=import-outside-toplevel
+            AuthenticatedUser,
+            create_session_cookie,
+        )
+
+        cookie = create_session_cookie(
+            AuthenticatedUser(username=username, is_admin=False),
+            "gitgateway-session-secret",
+        )
+        return {"cookie": f"session={cookie}"}
+
+    # --- admin gating ---
+
+    def test_list_backups_requires_admin(self, aws) -> None:
+        """A non-admin listing backups is rejected with 403."""
+        resp = _handle_api(_req(
+            "GET", "/api/admin/backups", headers=self._user_headers(),
+        ))
+        assert resp.status_code == 403
+
+    def test_manifest_requires_admin(self, aws) -> None:
+        """A non-admin reading a manifest is rejected with 403."""
+        resp = _handle_api(_req(
+            "GET", "/api/admin/backups/daily/2026-09-09",
+            headers=self._user_headers(),
+        ))
+        assert resp.status_code == 403
+
+    def test_restore_requires_admin(self, aws) -> None:
+        """A non-admin triggering a restore is rejected with 403."""
+        resp = _handle_api(_req(
+            "POST", "/api/admin/restore",
+            {"tier": "daily", "snapshot": "x", "repos": "all"},
+            headers=self._user_headers(),
+        ))
+        assert resp.status_code == 403
+
+    # --- list ---
+
+    def test_list_backups_empty(self, aws) -> None:
+        """Listing with no backups bucket contents returns an empty list."""
+        boto3.client("s3", region_name="us-east-1").create_bucket(
+            Bucket="gitgateway-backups",
+        )
+        resp = _handle_api(_req(
+            "GET", "/api/admin/backups", headers=self._admin_headers(),
+        ))
+        assert resp.status_code == 200
+        assert json.loads(resp.body) == []
+
+    def test_list_backups_error(self, aws) -> None:
+        """A failure listing snapshots returns 500."""
+        with patch(
+            "gitgateway.backup.list_snapshots",
+            side_effect=RuntimeError("boom"),
+        ):
+            resp = _handle_api(_req(
+                "GET", "/api/admin/backups", headers=self._admin_headers(),
+            ))
+        assert resp.status_code == 500
+
+    # --- manifest ---
+
+    def test_manifest_bad_path(self, aws) -> None:
+        """A malformed manifest path returns 400."""
+        resp = _handle_api(_req(
+            "GET", "/api/admin/backups/onlyonepart",
+            headers=self._admin_headers(),
+        ))
+        assert resp.status_code == 400
+
+    def test_manifest_not_found(self, aws) -> None:
+        """A missing manifest returns 404."""
+        with patch(
+            "gitgateway.backup.read_manifest",
+            side_effect=__import__(
+                "gitgateway.backup", fromlist=["BackupError"],
+            ).BackupError("nope"),
+        ):
+            resp = _handle_api(_req(
+                "GET", "/api/admin/backups/daily/2026-09-09",
+                headers=self._admin_headers(),
+            ))
+        assert resp.status_code == 404
+
+    def test_manifest_ok(self, aws) -> None:
+        """A present manifest is returned as JSON."""
+        with patch(
+            "gitgateway.backup.read_manifest",
+            return_value={"snapshot": "2026-09-09", "repos": []},
+        ):
+            resp = _handle_api(_req(
+                "GET", "/api/admin/backups/daily/2026-09-09",
+                headers=self._admin_headers(),
+            ))
+        assert resp.status_code == 200
+        assert json.loads(resp.body)["snapshot"] == "2026-09-09"
+
+    # --- restore ---
+
+    def test_restore_bad_json(self, aws) -> None:
+        """Restore with malformed JSON returns 400."""
+        req = _req("POST", "/api/admin/restore", headers=self._admin_headers())
+        req.body = b"{bad"
+        resp = _handle_api(req)
+        assert resp.status_code == 400
+
+    def test_restore_missing_fields(self, aws) -> None:
+        """Restore missing tier/snapshot/repos returns 400."""
+        resp = _handle_api(_req(
+            "POST", "/api/admin/restore", {"tier": "daily"},
+            headers=self._admin_headers(),
+        ))
+        assert resp.status_code == 400
+
+    def test_restore_starts_build(self, aws) -> None:
+        """A valid restore starts CodeBuild and records an audit event."""
+        with patch(
+            "gitgateway.codebuild.start_build", return_value="build-123",
+        ) as start, patch(
+            "gitgateway.audit.log_event",
+        ) as logev:
+            resp = _handle_api(_req(
+                "POST", "/api/admin/restore",
+                {"tier": "daily", "snapshot": "2026-09-09", "repos": "all"},
+                headers=self._admin_headers(),
+            ))
+        assert resp.status_code == 202
+        assert json.loads(resp.body)["build_id"] == "build-123"
+        start.assert_called_once()
+        logev.assert_called_once()
+
+    def test_restore_build_failure(self, aws) -> None:
+        """A CodeBuild failure returns 500."""
+        from gitgateway.codebuild import (  # pylint: disable=import-outside-toplevel
+            CodeBuildError,
+        )
+
+        with patch(
+            "gitgateway.codebuild.start_build",
+            side_effect=CodeBuildError("no project"),
+        ):
+            resp = _handle_api(_req(
+                "POST", "/api/admin/restore",
+                {"tier": "daily", "snapshot": "2026-09-09", "repos": "all"},
+                headers=self._admin_headers(),
+            ))
+        assert resp.status_code == 500
+
+    def test_restore_audit_failure_tolerated(self, aws) -> None:
+        """An audit-logging failure does not block the restore response."""
+        with patch(
+            "gitgateway.codebuild.start_build", return_value="b-1",
+        ), patch(
+            "gitgateway.audit.log_event", side_effect=RuntimeError("audit"),
+        ):
+            resp = _handle_api(_req(
+                "POST", "/api/admin/restore",
+                {"tier": "daily", "snapshot": "2026-09-09",
+                 "repos": [{"group": "t", "repo": "a"}]},
+                headers=self._admin_headers(),
+            ))
+        assert resp.status_code == 202
+
+
+class TestAdminBackupsPage:
+    """Cover the /admin/backups console page and its restore form."""
+
+    @staticmethod
+    def _info() -> dict:
+        """Build an admin user_info dict."""
+        return {"username": "root", "is_admin": True}
+
+    def test_admin_index_has_backups_link(self, aws) -> None:
+        """The admin index lists a Backups & Restore link."""
+        html = _get_page_content("/admin", self._info())
+        assert 'href="/admin/backups"' in html
+
+    def test_backups_page_requires_admin(self, aws) -> None:
+        """A non-admin hitting /admin/backups gets 403 content."""
+        html = _get_page_content(
+            "/admin/backups", {"username": "alice", "is_admin": False},
+        )
+        assert "403" in html
+
+    def test_backups_page_empty(self, aws) -> None:
+        """With an empty backups bucket the page shows the empty state."""
+        boto3.client("s3", region_name="us-east-1").create_bucket(
+            Bucket="gitgateway-backups",
+        )
+        html = _get_page_content("/admin/backups", self._info())
+        assert "Backups &amp; Restore" in html
+        assert "No snapshots available yet." in html
+
+    def test_backups_page_lists_snapshots(self, aws) -> None:
+        """Snapshots are rendered as rows and restore options."""
+        with patch(
+            "gitgateway.backup.list_snapshots",
+            return_value=[{"tier": "daily", "snapshot": "2026-09-09"}],
+        ):
+            html = _get_page_content("/admin/backups", self._info())
+        assert "2026-09-09" in html
+        assert "daily/2026-09-09" in html
+        assert "Start Restore" in html
+
+    def test_backups_page_error(self, aws) -> None:
+        """A snapshot-listing failure shows the error banner."""
+        with patch(
+            "gitgateway.backup.list_snapshots",
+            side_effect=RuntimeError("boom"),
+        ):
+            html = _get_page_content("/admin/backups", self._info())
+        assert "Could not load backup snapshots." in html
