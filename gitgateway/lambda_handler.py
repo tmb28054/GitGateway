@@ -4334,6 +4334,11 @@ def _get_admin_content(path: str) -> str:
     if path == "/admin/backups":
         return _render_admin_backups_page()
 
+    if path.startswith("/admin/backups/"):
+        parts = [p for p in path[len("/admin/backups/"):].split("/") if p]
+        if len(parts) == 2:
+            return _render_backup_manifest_page(parts[0], parts[1])
+
     return f"<h1>Admin</h1><p>Path: {path}</p>"
 
 
@@ -4474,8 +4479,8 @@ def _render_admin_backups_page() -> str:
           <td style="padding:0.5rem;font-weight:600;">
             {html.escape(name)}</td>
           <td style="padding:0.5rem;">
-            <a href="/api/admin/backups/{html.escape(tier)}/{html.escape(name)}"
-              target="_blank">View manifest</a></td>
+            <a href="/admin/backups/{html.escape(tier)}/{html.escape(name)}">
+              View manifest</a></td>
         </tr>"""
         label = f"{tier} / {name}"
         options += (
@@ -4577,6 +4582,155 @@ def _render_admin_backups_page() -> str:
       }} else {{
         status.textContent = 'Error: ' + (data.error || resp.status);
       }}
+    }}
+    </script>"""
+
+
+def _format_bytes(num: int) -> str:
+    """Format a byte count as a human-readable string.
+
+    Args:
+        num: Number of bytes.
+
+    Returns:
+        A short human-readable size (e.g. '1.2 MB').
+    """
+    size = float(num)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"  # pragma: no cover
+
+
+def _render_backup_manifest_page(tier: str, snapshot: str) -> str:
+    """Render a single snapshot manifest as a readable table.
+
+    Args:
+        tier: The snapshot tier (daily/weekly/monthly).
+        snapshot: The snapshot id (e.g. 2026-09-07).
+
+    Returns:
+        HTML content for the manifest detail page.
+    """
+    import html  # pylint: disable=import-outside-toplevel
+
+    from gitgateway import backup  # pylint: disable=import-outside-toplevel
+
+    backup_bucket = _os_environ().get(
+        "BACKUP_BUCKET", backup.DEFAULT_BACKUP_BUCKET,
+    )
+    safe_tier = html.escape(tier)
+    safe_snap = html.escape(snapshot)
+    header = f"""
+    <p style="margin-top:0.5rem;">
+      <a href="/admin/backups">&larr; Back to backups</a></p>
+    <h1>Snapshot {safe_tier} / {safe_snap}</h1>"""
+
+    try:
+        manifest = backup.read_manifest(
+            tier, snapshot, backup_bucket=backup_bucket,
+        )
+    except backup.BackupError as exc:
+        return f"""{header}
+    <div style="margin:1rem 0;padding:0.75rem 1rem;background:#ffeef0;
+      border:1px solid #f9c0c0;border-radius:6px;color:#cb2431;">
+      {html.escape(str(exc))}</div>"""
+
+    def _stat(label: str, value: object) -> str:
+        return f"""<div style="padding:0.75rem 1rem;border:1px solid #e1e4e8;
+          border-radius:6px;min-width:8rem;">
+          <div style="font-size:0.75rem;color:#586069;
+            text-transform:uppercase;">{label}</div>
+          <div style="font-size:1.25rem;font-weight:600;">{value}</div>
+        </div>"""
+
+    tiers = ", ".join(html.escape(t) for t in manifest.get("tiers", []))
+    summary = f"""
+    <div style="display:flex;gap:0.75rem;flex-wrap:wrap;margin:1rem 0;">
+      {_stat("Repos", manifest.get("repo_count", 0))}
+      {_stat("OK", manifest.get("ok_count", 0))}
+      {_stat("Empty", manifest.get("empty_count", 0))}
+      {_stat("Failed", manifest.get("failed_count", 0))}
+    </div>
+    <table style="border-collapse:collapse;margin-bottom:1.5rem;">
+      <tbody>
+        <tr><td style="padding:0.25rem 1rem 0.25rem 0;color:#586069;">
+          Tiers</td><td>{tiers}</td></tr>
+        <tr><td style="padding:0.25rem 1rem 0.25rem 0;color:#586069;">
+          Started</td><td>{html.escape(str(manifest.get("started_at", "")))}
+          </td></tr>
+        <tr><td style="padding:0.25rem 1rem 0.25rem 0;color:#586069;">
+          Finished</td><td>{html.escape(str(manifest.get("finished_at", "")))}
+          </td></tr>
+      </tbody>
+    </table>"""
+
+    status_colors = {
+        "ok": "#2ea44f", "empty": "#9a6700", "error": "#cb2431",
+    }
+    rows = ""
+    for repo in manifest.get("repos", []):
+        status = repo.get("status", "")
+        color = status_colors.get(status, "#586069")
+        refs = repo.get("refs") or []
+        detail = html.escape(repo.get("error", "")) if status != "ok" else (
+            f"{len(refs)} ref{'s' if len(refs) != 1 else ''}"
+        )
+        rows += f"""<tr style="border-bottom:1px solid #f0f0f0;">
+          <td style="padding:0.5rem;font-weight:600;">
+            {html.escape(repo.get("group", ""))}/{html.escape(
+                repo.get("repo", ""))}</td>
+          <td style="padding:0.5rem;">
+            <span style="color:{color};font-weight:600;">
+            {html.escape(status)}</span></td>
+          <td style="padding:0.5rem;text-align:right;">
+            {_format_bytes(repo.get("bundle_bytes", 0))}</td>
+          <td style="padding:0.5rem;text-align:right;">
+            {repo.get("lfs_object_count", 0)}</td>
+          <td style="padding:0.5rem;text-align:right;">
+            {_format_bytes(repo.get("lfs_bytes", 0))}</td>
+          <td style="padding:0.5rem;color:#586069;font-size:0.85rem;">
+            {detail}</td>
+        </tr>"""
+
+    if not rows:
+        rows = """<tr><td colspan="6" style="padding:1.5rem;color:#586069;
+          text-align:center;">This snapshot contains no repositories.</td>
+          </tr>"""
+
+    return f"""{header}
+    {summary}
+    <input type="text" id="repo-filter" onkeyup="filterRepos()"
+      placeholder="Filter by repository, status, or detail..."
+      style="width:100%;box-sizing:border-box;padding:0.5rem 0.7rem;
+      margin-bottom:1rem;border:1px solid #d1d5da;border-radius:6px;">
+    <table style="width:100%;border-collapse:collapse;">
+      <thead>
+        <tr style="border-bottom:2px solid #e1e4e8;">
+          <th style="text-align:left;padding:0.5rem;">Repository</th>
+          <th style="text-align:left;padding:0.5rem;">Status</th>
+          <th style="text-align:right;padding:0.5rem;">Bundle</th>
+          <th style="text-align:right;padding:0.5rem;">LFS objects</th>
+          <th style="text-align:right;padding:0.5rem;">LFS size</th>
+          <th style="text-align:left;padding:0.5rem;">Detail</th>
+        </tr>
+      </thead>
+      <tbody id="repo-table">
+        {rows}
+      </tbody>
+    </table>
+
+    <script>
+    function filterRepos() {{
+      const q = document.getElementById('repo-filter').value.toLowerCase();
+      const rows = document.querySelectorAll('#repo-table tr');
+      rows.forEach(function(row) {{
+        const text = row.textContent.toLowerCase();
+        row.style.display = text.indexOf(q) === -1 ? 'none' : '';
+      }});
     }}
     </script>"""
 

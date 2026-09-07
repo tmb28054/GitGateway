@@ -3829,3 +3829,115 @@ class TestAdminBackupsPage:
         ):
             html = _get_page_content("/admin/backups", self._info())
         assert "Could not load backup snapshots." in html
+
+    def test_manifest_link_points_to_admin_page(self, aws) -> None:
+        """The snapshot's View manifest link targets the admin page."""
+        with patch(
+            "gitgateway.backup.list_snapshots",
+            return_value=[{"tier": "daily", "snapshot": "2026-09-09"}],
+        ):
+            html = _get_page_content("/admin/backups", self._info())
+        assert 'href="/admin/backups/daily/2026-09-09"' in html
+
+    def test_manifest_page_renders_table(self, aws) -> None:
+        """The manifest page shows summary stats and a per-repo table."""
+        manifest = {
+            "snapshot": "2026-09-09",
+            "tiers": ["daily"],
+            "started_at": "2026-09-09T05:00:00Z",
+            "finished_at": "2026-09-09T05:12:00Z",
+            "repo_count": 3,
+            "ok_count": 1,
+            "empty_count": 1,
+            "failed_count": 1,
+            "repos": [
+                {"group": "team", "repo": "app", "status": "ok",
+                 "bundle_bytes": 2048, "lfs_object_count": 2,
+                 "lfs_bytes": 1048576, "refs": ["refs/heads/main"]},
+                {"group": "team", "repo": "fresh", "status": "empty",
+                 "bundle_bytes": 0, "lfs_object_count": 0, "lfs_bytes": 0,
+                 "refs": [], "error": "Repository has no refs to bundle"},
+                {"group": "team", "repo": "ghost", "status": "error",
+                 "bundle_bytes": 0, "lfs_object_count": 0, "lfs_bytes": 0,
+                 "refs": [], "error": "not found in S3"},
+            ],
+        }
+        with patch("gitgateway.backup.read_manifest", return_value=manifest):
+            html = _get_page_content(
+                "/admin/backups/daily/2026-09-09", self._info(),
+            )
+        assert "Snapshot daily / 2026-09-09" in html
+        assert "team/app" in html
+        assert "team/fresh" in html
+        assert "team/ghost" in html
+        # Readable sizes and ref counts are rendered.
+        assert "1.0 MB" in html
+        assert "1 ref" in html
+        assert "Repository has no refs to bundle" in html
+        assert 'href="/admin/backups"' in html  # back link
+
+    def test_manifest_page_not_found(self, aws) -> None:
+        """A missing manifest shows an inline error, not a crash."""
+        from gitgateway.backup import (  # pylint: disable=import-outside-toplevel
+            BackupError,
+        )
+
+        with patch(
+            "gitgateway.backup.read_manifest",
+            side_effect=BackupError("Manifest not found"),
+        ):
+            html = _get_page_content(
+                "/admin/backups/daily/1999-01-01", self._info(),
+            )
+        assert "Manifest not found" in html
+
+    def test_manifest_page_empty_repos(self, aws) -> None:
+        """A manifest with no repos shows the empty-state row."""
+        manifest = {
+            "snapshot": "2026-09-09", "tiers": ["daily"],
+            "started_at": "", "finished_at": "",
+            "repo_count": 0, "ok_count": 0, "empty_count": 0,
+            "failed_count": 0, "repos": [],
+        }
+        with patch("gitgateway.backup.read_manifest", return_value=manifest):
+            html = _get_page_content(
+                "/admin/backups/daily/2026-09-09", self._info(),
+            )
+        assert "no repositories" in html
+
+    def test_manifest_page_bad_path_falls_through(self, aws) -> None:
+        """A malformed manifest path falls through to the admin fallback."""
+        html = _get_page_content(
+            "/admin/backups/onlyonepart", self._info(),
+        )
+        assert "Path:" in html
+
+
+class TestFormatBytes:
+    """Tests for the _format_bytes helper."""
+
+    def test_bytes(self) -> None:
+        """Small values render as bytes."""
+        from gitgateway.lambda_handler import (  # pylint: disable=import-outside-toplevel
+            _format_bytes,
+        )
+
+        assert _format_bytes(512) == "512 B"
+
+    def test_kb_mb_gb(self) -> None:
+        """Larger values scale to KB/MB/GB."""
+        from gitgateway.lambda_handler import (  # pylint: disable=import-outside-toplevel
+            _format_bytes,
+        )
+
+        assert _format_bytes(2048) == "2.0 KB"
+        assert _format_bytes(1048576) == "1.0 MB"
+        assert _format_bytes(1073741824) == "1.0 GB"
+
+    def test_tb_caps(self) -> None:
+        """Very large values render in TB (the last unit)."""
+        from gitgateway.lambda_handler import (  # pylint: disable=import-outside-toplevel
+            _format_bytes,
+        )
+
+        assert _format_bytes(5 * 1024 ** 4).endswith("TB")

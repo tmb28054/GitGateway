@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-09-06
+
+### Changed
+- The backups admin "View manifest" link now opens a readable manifest page
+  (`/admin/backups/<tier>/<snapshot>`) with summary stats (repo/ok/empty/failed
+  counts, tiers, timestamps) and a filterable per-repository table showing
+  status, bundle size, LFS object count/size, and ref count or error, instead
+  of dumping raw JSON from the API endpoint.
+
 ## [0.2.4] - 2026-09-06
 
 ### Fixed
