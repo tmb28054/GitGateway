@@ -59,6 +59,7 @@ class TestBuildParameters:
         assert "LintingLayerArn" in keys
         assert "BinariesLayerArn" in keys
         assert "JwtAudience" in keys
+        assert "EnableKmsEncryption" in keys
 
         domain_param = next(
             p for p in params if p["ParameterKey"] == "DomainName"
@@ -84,6 +85,25 @@ class TestBuildParameters:
         )
         aud = next(p for p in params if p["ParameterKey"] == "JwtAudience")
         assert aud["ParameterValue"] == "gitgateway"
+
+    def test_kms_enabled_by_default(self) -> None:
+        """EnableKmsEncryption defaults to 'true'."""
+        params = _build_parameters("d", "a", True, False, "b", "k", "")
+        kms = next(
+            p for p in params if p["ParameterKey"] == "EnableKmsEncryption"
+        )
+        assert kms["ParameterValue"] == "true"
+
+    def test_kms_can_be_disabled(self) -> None:
+        """enable_kms_encryption=False maps to 'false'."""
+        params = _build_parameters(
+            "d", "a", True, False, "b", "k", "",
+            enable_kms_encryption=False,
+        )
+        kms = next(
+            p for p in params if p["ParameterKey"] == "EnableKmsEncryption"
+        )
+        assert kms["ParameterValue"] == "false"
 
     def test_boolean_values(self) -> None:
         """Converts booleans to lowercase strings."""

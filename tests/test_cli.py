@@ -265,6 +265,7 @@ class TestDeployCommand:
         assert kwargs["jwt_audience"] == "git"
         assert kwargs["enable_codebuild"] is True
         assert kwargs["enable_ai"] is False
+        assert kwargs["enable_kms_encryption"] is True
         output = json.loads(capsys.readouterr().out)
         assert output["action"] == "deploy"
         assert output["stack_name"] == "mygw"
@@ -282,12 +283,14 @@ class TestDeployCommand:
                 "--jwt-audience", "gitgateway",
                 "--enable-ai",
                 "--disable-codebuild",
+                "--disable-kms",
             ])
         assert result == 0
         kwargs = ds.call_args.kwargs
         assert kwargs["jwt_audience"] == "gitgateway"
         assert kwargs["enable_ai"] is True
         assert kwargs["enable_codebuild"] is False
+        assert kwargs["enable_kms_encryption"] is False
         # Default stack name is applied.
         assert kwargs["stack_name"] == "gitgateway"
 

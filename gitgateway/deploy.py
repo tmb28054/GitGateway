@@ -582,6 +582,7 @@ def deploy_stack(  # pylint: disable=too-many-positional-arguments,too-many-loca
     enable_ai: bool = False,
     idp_url: str = "",
     jwt_audience: str = "git",
+    enable_kms_encryption: bool = True,
 ) -> dict:
     """Deploy or update the GitGateway CloudFormation stack.
 
@@ -599,6 +600,8 @@ def deploy_stack(  # pylint: disable=too-many-positional-arguments,too-many-loca
         enable_ai: Whether to enable AI features.
         idp_url: Identity provider URL for OAuth.
         jwt_audience: Expected JWT 'aud' claim from the IdP (default 'git').
+        enable_kms_encryption: Use a customer-managed KMS key for S3 and
+            DynamoDB when True; otherwise use SSE-S3/AWS-owned keys.
 
     Returns:
         Dictionary of mapped stack outputs.
@@ -668,6 +671,7 @@ def deploy_stack(  # pylint: disable=too-many-positional-arguments,too-many-loca
         binaries_layer_arn=binaries_layer_arn,
         backup_source_key=backup_source_key,
         jwt_audience=jwt_audience,
+        enable_kms_encryption=enable_kms_encryption,
     )
 
     kwargs = {
@@ -798,6 +802,7 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
     binaries_layer_arn: str = "",
     backup_source_key: str = BACKUP_SOURCE_KEY,
     jwt_audience: str = "git",
+    enable_kms_encryption: bool = True,
 ) -> list[dict]:
     """Build CloudFormation parameters list.
 
@@ -814,6 +819,8 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
         binaries_layer_arn: ARN of the binary tools layer.
         backup_source_key: S3 key of the backup CodeBuild source zip.
         jwt_audience: Expected JWT 'aud' claim from the IdP.
+        enable_kms_encryption: Encrypt S3/DynamoDB with a customer-managed
+            KMS key when True; use SSE-S3/AWS-owned keys when False.
 
     Returns:
         List of parameter dicts for CloudFormation.
@@ -847,6 +854,10 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
         {
             "ParameterKey": "JwtAudience",
             "ParameterValue": jwt_audience,
+        },
+        {
+            "ParameterKey": "EnableKmsEncryption",
+            "ParameterValue": str(enable_kms_encryption).lower(),
         },
         {
             "ParameterKey": "CoreLayerArn",

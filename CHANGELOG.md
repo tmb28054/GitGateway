@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legacy top-level boolean claims, so admin/access are mapped correctly.
 
 ### Changed
+- Made customer-managed KMS encryption optional via a new
+  `EnableKmsEncryption` CloudFormation parameter (default `true`). When set to
+  `false`, S3 buckets fall back to SSE-S3 (AES256), DynamoDB tables use the
+  AWS-owned default key, and the KMS key/alias and KMS IAM grants are not
+  created. Exposed through `deploy_stack(enable_kms_encryption=...)` and the
+  `gitgateway deploy --disable-kms` flag.
 - Added a `JwtAudience` CloudFormation parameter (default `git`, matching the
   IdP) wired into the Lambda's `GITGATEWAY_JWT_AUDIENCE` env var, and a
   `--jwt-audience` deploy flag, so the expected JWT audience is pinned at

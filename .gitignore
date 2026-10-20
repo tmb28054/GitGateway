@@ -80,6 +80,9 @@ Thumbs.db
 .yamllint
 .cfnlintrc
 
+# Local project rules / steering (kept out of version control)
+.kiro/steering/no-kms-deploy.md
+
 # Project specific
 trash/
 2026-08-21.tar.gz

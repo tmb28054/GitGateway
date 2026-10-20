@@ -47,6 +47,14 @@ Parameters:
       Expected JWT 'aud' claim from the IdP. Must match the audience the IdP
       mints for this service (the IdP currently issues 'git'). Leave empty to
       disable audience verification (not recommended).
+  EnableKmsEncryption:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      When 'true', encrypt S3 buckets and DynamoDB tables with a
+      customer-managed KMS key. When 'false', S3 uses SSE-S3 (AES256) and
+      DynamoDB uses the AWS-owned default key, and no KMS key is created.
   CoreLayerArn:
     Type: String
     Default: ''
@@ -73,6 +81,7 @@ Parameters:
     Description: EventBridge schedule for the nightly backup (UTC)
 
 Conditions:
+  UseKms: !Equals [!Ref EnableKmsEncryption, 'true']
   HasCoreLayer: !Not [!Equals [!Ref CoreLayerArn, '']]
   HasLintingLayer: !Not [!Equals [!Ref LintingLayerArn, '']]
   HasBinariesLayer: !Not [!Equals [!Ref BinariesLayerArn, '']]
@@ -88,6 +97,7 @@ Resources:
   # than mixing SSE-KMS / SSE-S3 / AWS-owned keys (remediation R-9).
   DataKey:
     Type: AWS::KMS::Key
+    Condition: UseKms
     Properties:
       Description: !Sub 'GitGateway data-at-rest CMK for ${StackNamePrefix}'
       EnableKeyRotation: true
@@ -118,6 +128,7 @@ Resources:
 
   DataKeyAlias:
     Type: AWS::KMS::Alias
+    Condition: UseKms
     Properties:
       AliasName: !Sub 'alias/${StackNamePrefix}-data'
       TargetKeyId: !Ref DataKey
@@ -128,9 +139,11 @@ Resources:
       BucketName: !Sub '${StackNamePrefix}-repos'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !Ref DataKey
+          - ServerSideEncryptionByDefault: !If
+              - UseKms
+              - SSEAlgorithm: aws:kms
+                KMSMasterKeyID: !Ref DataKey
+              - SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -163,9 +176,11 @@ Resources:
       BucketName: !Sub '${StackNamePrefix}-lfs'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !Ref DataKey
+          - ServerSideEncryptionByDefault: !If
+              - UseKms
+              - SSEAlgorithm: aws:kms
+                KMSMasterKeyID: !Ref DataKey
+              - SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -198,9 +213,11 @@ Resources:
       BucketName: !Sub '${StackNamePrefix}-backups'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !Ref DataKey
+          - ServerSideEncryptionByDefault: !If
+              - UseKms
+              - SSEAlgorithm: aws:kms
+                KMSMasterKeyID: !Ref DataKey
+              - SSEAlgorithm: AES256
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -260,10 +277,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-repos'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       KeySchema:
@@ -282,10 +301,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-access'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       KeySchema:
@@ -304,10 +325,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-prs'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       KeySchema:
@@ -326,10 +349,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-comments'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       KeySchema:
@@ -348,10 +373,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-webhooks'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       KeySchema:
@@ -370,10 +397,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-status-checks'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       KeySchema:
@@ -392,10 +421,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-audit'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       TimeToLiveSpecification:
@@ -417,10 +448,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-notifications'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       KeySchema:
@@ -439,10 +472,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-embeddings'
       BillingMode: PAY_PER_REQUEST
-      SSESpecification:
-        SSEEnabled: true
-        SSEType: KMS
-        KMSMasterKeyId: !Ref DataKey
+      SSESpecification: !If
+        - UseKms
+        - SSEEnabled: true
+          SSEType: KMS
+          KMSMasterKeyId: !Ref DataKey
+        - !Ref 'AWS::NoValue'
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       KeySchema:
@@ -524,14 +559,18 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gitgateway/gemini-api-key-*'
               # Use (not administer) the data CMK for S3/DynamoDB encryption.
-              - Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:Encrypt
-                  - kms:GenerateDataKey
-                  - kms:DescribeKey
-                Resource:
-                  - !GetAtt DataKey.Arn
+              # Only present when KMS encryption is enabled.
+              - !If
+                - UseKms
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:Encrypt
+                    - kms:GenerateDataKey
+                    - kms:DescribeKey
+                  Resource:
+                    - !GetAtt DataKey.Arn
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action:
                   - lambda:InvokeFunction
@@ -767,14 +806,18 @@ Resources:
                   - !GetAtt NotificationsTable.Arn
                   - !GetAtt EmbeddingsTable.Arn
               # Decrypt source data and encrypt backup artifacts with the CMK.
-              - Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:Encrypt
-                  - kms:GenerateDataKey
-                  - kms:DescribeKey
-                Resource:
-                  - !GetAtt DataKey.Arn
+              # Only present when KMS encryption is enabled.
+              - !If
+                - UseKms
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:Encrypt
+                    - kms:GenerateDataKey
+                    - kms:DescribeKey
+                  Resource:
+                    - !GetAtt DataKey.Arn
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action:
                   - sns:Publish

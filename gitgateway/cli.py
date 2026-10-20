@@ -167,6 +167,13 @@ def _build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-loca
         "--disable-codebuild", action="store_true",
         help="Disable CodeBuild integration (enabled by default)",
     )
+    deploy_parser.add_argument(
+        "--disable-kms", action="store_true",
+        help=(
+            "Disable customer-managed KMS encryption; use SSE-S3/AWS-owned "
+            "keys instead (KMS enabled by default)"
+        ),
+    )
     deploy_parser.set_defaults(func=_handle_deploy)
 
     return parser
@@ -404,6 +411,7 @@ def _handle_deploy(args: argparse.Namespace) -> int:
             enable_ai=args.enable_ai,
             idp_url=args.idp_url,
             jwt_audience=args.jwt_audience,
+            enable_kms_encryption=not args.disable_kms,
         )
     except DeployError as exc:
         sys.stderr.write(f"Error: {exc}\n")
