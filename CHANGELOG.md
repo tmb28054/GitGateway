@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Tracked performance note `docs/performance/repo-sync-latency.md` recording
+  the measured git first-request latency (147 objects / 8.4 s cold sync on
+  `botthouse/GitGateway`), its request-count-bound root cause, and the
+  candidate optimizations (parallel downloads first).
 - Structured `SYNC_METRIC` logging for S3<->/tmp repo syncs in `storage.py`
   (operation, object/byte counts, duration, throughput, and a warm-cache flag
   for downloads). Emitted as a single JSON log line per sync so the first-
