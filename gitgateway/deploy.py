@@ -58,6 +58,7 @@ CORE_LAYER_DEPS = [
     "pygments",
     "pyjwt[crypto]",
     "cryptography",
+    "defusedxml",
     "requests",
 ]
 

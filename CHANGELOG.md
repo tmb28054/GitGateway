@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Added `defusedxml` to the core Lambda layer dependencies (`CORE_LAYER_DEPS`).
+  The R-21 SAML-metadata parsing switched to `defusedxml`, but it was only
+  added to `pyproject.toml`, not the layer bundle, so the deployed Lambda
+  raised `ModuleNotFoundError: defusedxml` during login (HTTP 500). The core
+  layer now bundles it.
 - OAuth callback now works with the IdP delivering the JWT in the URL
   fragment (`#token=...`). A tokenless `/auth/callback` GET returns a small
   bootstrap page that reads `location.hash` and re-submits the token via POST
