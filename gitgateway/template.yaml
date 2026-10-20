@@ -621,6 +621,13 @@ Resources:
           BACKUP_CODEBUILD_PROJECT: !Ref BackupProject
           BACKUP_SOURCE_BUCKET: !Ref RepoBucket
           BACKUP_SOURCE_KEY: !Ref BackupSourceKey
+      # Emit structured JSON logs at INFO so application logs (including the
+      # SYNC_METRIC repo-sync measurements) actually reach CloudWatch. The
+      # default effective level is WARNING, which silently dropped LOG.info.
+      LoggingConfig:
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+        SystemLogLevel: INFO
 
   ApiHandlerPermission:
     Type: AWS::Lambda::Permission
