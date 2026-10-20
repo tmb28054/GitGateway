@@ -118,9 +118,11 @@ def call_gemini(
             f"max {config.max_calls_per_hour} calls/hour",
         )
 
+    # Send the API key in a request header rather than the URL query
+    # string so it cannot leak into access logs, proxies, or traces.
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{config.model}:generateContent?key={config.api_key}"
+        f"{config.model}:generateContent"
     )
 
     payload = {
@@ -131,6 +133,7 @@ def call_gemini(
         response = requests.post(
             url,
             json=payload,
+            headers={"x-goog-api-key": config.api_key},
             timeout=60,
         )
         response.raise_for_status()

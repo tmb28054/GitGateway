@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- OAuth callback now works with the IdP delivering the JWT in the URL
+  fragment (`#token=...`). A tokenless `/auth/callback` GET returns a small
+  bootstrap page that reads `location.hash` and re-submits the token via POST
+  (keeping it out of query strings and access logs); the server validates the
+  posted token. This resolves the "Missing token parameter" error after the
+  IdP moved the token out of the query string.
+- `validate_jwt` now recognizes `gitgateway-admin` / `gitgateway-access` from
+  the IdP's `claims` array (its current token format), in addition to the
+  legacy top-level boolean claims, so admin/access are mapped correctly.
+
+### Changed
+- Added a `JwtAudience` CloudFormation parameter (default `git`, matching the
+  IdP) wired into the Lambda's `GITGATEWAY_JWT_AUDIENCE` env var, and a
+  `--jwt-audience` deploy flag, so the expected JWT audience is pinned at
+  deploy time rather than left unset. Also wired `ALLOWED_ORIGINS` to the
+  deployment's custom domain so the CORS allowlist is populated by default.
+
+### Security
+- The OAuth callback no longer falls back to an unverified token decode when
+  signature/issuer/audience validation fails. An unaccepted token is now
+  rejected with a 401 and no session is issued, closing an authentication
+  bypass where a forged/invalid JWT could mint a session.
+- Restrict CORS to an allowlist instead of `Access-Control-Allow-Origin: *`.
+  The request Origin is reflected only when it matches `ALLOWED_ORIGINS`
+  (or the deployment `DOMAIN_NAME`); otherwise no CORS origin is emitted
+  (remediation R-6, closes finding F-14).
+- Send the Gemini API key in the `x-goog-api-key` request header rather than
+  the URL query string, preventing key leakage into logs/traces (R-10,
+  closes finding F-11).
+- Enable JWT audience verification in `validate_jwt` (via the `audience`
+  argument or the `GITGATEWAY_JWT_AUDIENCE` env var) and replace the
+  substring-based SAML certificate extraction with a `defusedxml`-based,
+  namespace-aware XML parse (R-21, closes findings F-1 and F-2).
+- Standardize data-at-rest encryption on a customer-managed KMS key
+  (`AWS::KMS::Key` with rotation) applied to the repos, LFS, and backups S3
+  buckets and all DynamoDB tables, with the key policy scoped to the Lambda
+  and backup roles (R-9, closes finding F-6).
+- Add S3 `PublicAccessBlockConfiguration`, TLS-only bucket policies
+  (`aws:SecureTransport`), and versioning to all three buckets (R-7, closes
+  finding F-8).
+- Tighten IAM: DynamoDB access is scoped to explicit per-table ARNs instead
+  of a `table/${prefix}-*` wildcard, the runtime role no longer holds broad
+  Secrets Manager write/create (write is limited to the single Gemini-key
+  secret; `CreateSecret` removed), the backup role is read-only on DynamoDB,
+  and both roles get least-privilege use of the data KMS key (R-11, closes
+  finding F-13).
+- Add an AWS WAFv2 web ACL (CloudFront scope) with AWS managed rule groups
+  (Common, Known Bad Inputs) and an IP rate-based rule, with request logging,
+  in front of the distribution (R-5).
+- Enable DynamoDB point-in-time recovery on all tables.
+- Enforce per-repo/per-group authorization (`check_permission`) on the git
+  Smart-HTTP data plane. Clone/fetch now require `readonly` and push requires
+  `contributor` on the target repository; unauthorized access is refused with
+  403 (remediation R-1, closes finding F-4).
+- Apply the same fail-closed RBAC gate to the Git LFS data plane (batch
+  download requires `readonly`; upload and lock operations require
+  `contributor`) (R-1).
+- Stop hardcoding `read/write` scope for federated JWT git credentials; the
+  effective scope now reflects the credential's `gitgateway-access` claim and
+  is subordinate to the RBAC gate (R-2, closes finding F-3).
+- Add a fail-closed authentication gate to the entire REST API surface; all
+  `/api/*` routes now require a verified session and administrative routes
+  (group, access-control, branch-registration, and secret updates)
+  additionally require an admin session (R-3/R-4, closes finding F-5).
+
+### Added
+- Security design document (`docs/security/security-design.md`) and a
+  print-ready PDF (`docs/security/security-design.pdf`) prepared for the AWS
+  SecAgent review, covering architecture, trust boundaries, data flows,
+  authentication/authorization, encryption, secrets handling, the Git data
+  plane, the AI/Gemini integration, and a consolidated findings register.
+- Architecture and push data-flow diagrams (`docs/security/architecture.svg`,
+  `docs/security/dataflow-push.svg`) embedded in the security design document.
+- Impact-based severity rationale for each finding in the register (1 Critical,
+  2 High, 4 Medium, 8 Low).
+- Security review remediation plan (`docs/security/remediation-plan.md`)
+  triaging the AWS SecAgent review (`GitGateway-comments-2026-09-27.csv`) into
+  real code/config defects, documentation gaps, and not-applicable PCI controls.
+  Defines 22 prioritized remediation items (R-1..R-22) with owners, effort, and
+  a POA&M table; P0 items close the Critical data-plane authorization gap and
+  both High findings.
+
 ## [0.2.5] - 2026-09-06
 
 ### Changed

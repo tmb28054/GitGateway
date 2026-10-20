@@ -191,23 +191,95 @@ class TestErrorResponse:
 class TestCorsHeaders:
     """Tests for cors_headers function."""
 
-    def test_returns_cors_headers(self) -> None:
-        """Returns standard CORS headers."""
+    def test_no_wildcard_origin(self) -> None:
+        """CORS never returns a wildcard origin; method/header lists stand."""
         headers = cors_headers()
-        assert headers["Access-Control-Allow-Origin"] == "*"
+        assert headers.get("Access-Control-Allow-Origin") != "*"
+        assert "Access-Control-Allow-Origin" not in headers
         assert "GET" in headers["Access-Control-Allow-Methods"]
         assert "Authorization" in headers["Access-Control-Allow-Headers"]
+        assert headers["Vary"] == "Origin"
+
+    def test_reflects_allowlisted_origin(self) -> None:
+        """An origin in ALLOWED_ORIGINS is reflected back."""
+        from unittest.mock import patch
+
+        req = Request(
+            path="/api/x",
+            headers={"origin": "https://git.example.com"},
+        )
+        with patch.dict(
+            "os.environ",
+            {"ALLOWED_ORIGINS": "https://git.example.com,https://ci.example.com"},
+        ):
+            headers = cors_headers(req)
+        assert headers["Access-Control-Allow-Origin"] == "https://git.example.com"
+        assert headers["Access-Control-Allow-Credentials"] == "true"
+
+    def test_rejects_unlisted_origin(self) -> None:
+        """An origin not in the allowlist is not reflected."""
+        from unittest.mock import patch
+
+        req = Request(
+            path="/api/x", headers={"origin": "https://evil.example.com"},
+        )
+        with patch.dict(
+            "os.environ", {"ALLOWED_ORIGINS": "https://git.example.com"},
+        ):
+            headers = cors_headers(req)
+        assert "Access-Control-Allow-Origin" not in headers
+
+    def test_domain_name_fallback(self) -> None:
+        """With no ALLOWED_ORIGINS, the DOMAIN_NAME origin is allowed."""
+        from unittest.mock import patch
+
+        req = Request(
+            path="/api/x", headers={"origin": "https://git.example.com"},
+        )
+        with patch.dict(
+            "os.environ",
+            {"ALLOWED_ORIGINS": "", "DOMAIN_NAME": "git.example.com"},
+            clear=False,
+        ):
+            headers = cors_headers(req)
+        assert headers["Access-Control-Allow-Origin"] == "https://git.example.com"
+
+    def test_no_config_allows_no_origin(self) -> None:
+        """With neither env var set, no cross-origin access is granted."""
+        from unittest.mock import patch
+
+        req = Request(
+            path="/api/x", headers={"origin": "https://git.example.com"},
+        )
+        with patch.dict(
+            "os.environ",
+            {"ALLOWED_ORIGINS": "", "DOMAIN_NAME": ""},
+            clear=False,
+        ):
+            headers = cors_headers(req)
+        assert "Access-Control-Allow-Origin" not in headers
 
 
 class TestHandleOptions:
     """Tests for handle_options function."""
 
     def test_returns_204_with_cors(self) -> None:
-        """Returns 204 with CORS headers."""
-        request = Request(method="OPTIONS", path="/api/repos")
-        response = handle_options(request)
+        """Returns 204 with CORS headers (no wildcard origin)."""
+        from unittest.mock import patch
+
+        request = Request(
+            method="OPTIONS", path="/api/repos",
+            headers={"origin": "https://git.example.com"},
+        )
+        with patch.dict(
+            "os.environ", {"ALLOWED_ORIGINS": "https://git.example.com"},
+        ):
+            response = handle_options(request)
         assert response.status_code == 204
-        assert "Access-Control-Allow-Origin" in response.headers
+        assert (
+            response.headers["Access-Control-Allow-Origin"]
+            == "https://git.example.com"
+        )
 
 
 class TestHandler:
@@ -227,10 +299,18 @@ class TestHandler:
         """API GET /api/groups returns the group list as JSON."""
         from unittest.mock import patch
 
+        from gitgateway.auth import AuthenticatedUser, create_session_cookie
+
+        # The API surface is now fail-closed: an authenticated session is
+        # required. Attach a valid session cookie so the list route runs.
+        cookie = create_session_cookie(
+            AuthenticatedUser(username="alice", is_admin=True),
+            "gitgateway-session-secret",
+        )
         event = {
             "requestContext": {"http": {"method": "GET", "path": "/api/groups"}},
             "rawQueryString": "",
-            "headers": {},
+            "headers": {"cookie": f"session={cookie}"},
         }
         with patch("gitgateway.db.list_groups", return_value=[]):
             result = handler(event)
@@ -281,12 +361,28 @@ class TestHandler:
             "application/vnd.git-lfs+json"
         )
 
-    def test_auth_route_missing_token(self) -> None:
-        """Auth callback without a token returns 400."""
+    def test_auth_route_get_serves_fragment_bootstrap(self) -> None:
+        """A tokenless GET auth callback serves the fragment bootstrap (200).
+
+        The IdP returns the token in the URL fragment, invisible to the
+        server, so the first hit returns an HTML page that recovers it.
+        """
         event = {
             "requestContext": {"http": {"method": "GET", "path": "/auth/callback"}},
             "rawQueryString": "",
             "headers": {},
+        }
+        result = handler(event)
+        assert result["statusCode"] == 200
+        assert "location.hash" in result["body"]
+
+    def test_auth_route_post_missing_token(self) -> None:
+        """A POST auth callback with no token returns 400."""
+        event = {
+            "requestContext": {"http": {"method": "POST", "path": "/auth/callback"}},
+            "rawQueryString": "",
+            "headers": {},
+            "body": "",
         }
         result = handler(event)
         assert result["statusCode"] == 400
@@ -330,11 +426,18 @@ class TestDispatch:
     """Tests for _dispatch function."""
 
     def test_api_dispatch(self) -> None:
-        """API handler returns JSON with CORS."""
+        """API handler returns JSON with CORS method/header metadata.
+
+        With no Origin header the response carries no
+        Access-Control-Allow-Origin (origins are allowlisted, not
+        wildcarded), but the method/header/Vary metadata is always present.
+        """
         request = Request(path="/api/test")
         response = _dispatch("api", request)
         assert response.headers["Content-Type"] == "application/json"
-        assert "Access-Control-Allow-Origin" in response.headers
+        assert "Access-Control-Allow-Methods" in response.headers
+        assert response.headers["Vary"] == "Origin"
+        assert "Access-Control-Allow-Origin" not in response.headers
 
     def test_git_dispatch_requires_auth(self) -> None:
         """Git dispatch without credentials returns 401."""
@@ -355,12 +458,19 @@ class TestDispatch:
         response = _dispatch("lfs", request)
         assert response.headers["Content-Type"] == "application/vnd.git-lfs+json"
 
-    def test_auth_dispatch_missing_token(self) -> None:
-        """Auth dispatch without a token returns a 400 HTML response."""
+    def test_auth_dispatch_serves_fragment_bootstrap(self) -> None:
+        """Auth callback without a query token serves the fragment bootstrap.
+
+        The IdP delivers the token in the URL fragment, which the server
+        cannot see, so a tokenless hit returns an HTML page that recovers the
+        token from location.hash (and shows "Missing token parameter" only if
+        the fragment has none).
+        """
         request = Request(path="/auth/callback")
         response = _dispatch("auth", request)
-        assert response.status_code == 400
-        assert "Missing token" in response.body
+        assert response.status_code == 200
+        assert "location.hash" in response.body
+        assert "Missing token parameter" in response.body
 
     def test_web_dispatch(self) -> None:
         """Web handler returns HTML."""

@@ -40,6 +40,13 @@ Parameters:
     Type: String
     Default: ''
     Description: Identity provider URL for OAuth authentication
+  JwtAudience:
+    Type: String
+    Default: git
+    Description: >-
+      Expected JWT 'aud' claim from the IdP. Must match the audience the IdP
+      mints for this service (the IdP currently issues 'git'). Leave empty to
+      disable audience verification (not recommended).
   CoreLayerArn:
     Type: String
     Default: ''
@@ -75,6 +82,46 @@ Conditions:
     - !Condition HasBinariesLayer
 
 Resources:
+  # Customer-managed KMS key used to encrypt all data stores (S3 buckets and
+  # DynamoDB tables) with a single, rotatable key whose access is restricted
+  # to the workload roles. Standardizes encryption at rest on a CMK rather
+  # than mixing SSE-KMS / SSE-S3 / AWS-owned keys (remediation R-9).
+  DataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'GitGateway data-at-rest CMK for ${StackNamePrefix}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Root account retains administrative control of the key.
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # The workload roles may use (not administer) the key. Referencing
+          # the role names avoids a circular dependency with the role ARNs.
+          - Sid: AllowWorkloadUse
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${StackNamePrefix}-lambda-role'
+                - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${StackNamePrefix}-backup-build-role'
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${StackNamePrefix}-data'
+      TargetKeyId: !Ref DataKey
+
   RepoBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -83,6 +130,32 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref DataKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  RepoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RepoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RepoBucket.Arn
+              - !Sub '${RepoBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   LfsBucket:
     Type: AWS::S3::Bucket
@@ -92,6 +165,32 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref DataKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  LfsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LfsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt LfsBucket.Arn
+              - !Sub '${LfsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   BackupBucket:
     Type: AWS::S3::Bucket
@@ -100,7 +199,15 @@ Resources:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref DataKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
       # Tiered retention: daily 30d, weekly 52w (~364d), monthly 36mo (~1095d).
       LifecycleConfiguration:
         Rules:
@@ -116,6 +223,24 @@ Resources:
             Status: Enabled
             Prefix: monthly/
             ExpirationInDays: 1095
+
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   AlertsTopic:
     Type: AWS::SNS::Topic
@@ -135,6 +260,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-repos'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -151,6 +282,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-access'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -167,6 +304,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-prs'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -183,6 +326,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-comments'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -199,6 +348,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-webhooks'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -215,6 +370,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-status-checks'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -231,6 +392,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-audit'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
@@ -250,6 +417,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-notifications'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -266,6 +439,12 @@ Resources:
     Properties:
       TableName: !Sub '${StackNamePrefix}-embeddings'
       BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -295,6 +474,8 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # DynamoDB access scoped to the specific tables this stack
+              # owns rather than a table/${prefix}-* wildcard (R-11).
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -304,7 +485,15 @@ Resources:
                   - dynamodb:Scan
                   - dynamodb:UpdateItem
                 Resource:
-                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackNamePrefix}-*'
+                  - !GetAtt ReposTable.Arn
+                  - !GetAtt AccessTable.Arn
+                  - !GetAtt PrsTable.Arn
+                  - !GetAtt CommentsTable.Arn
+                  - !GetAtt WebhooksTable.Arn
+                  - !GetAtt StatusChecksTable.Arn
+                  - !GetAtt AuditTable.Arn
+                  - !GetAtt NotificationsTable.Arn
+                  - !GetAtt EmbeddingsTable.Arn
               - Effect: Allow
                 Action:
                   - s3:GetObject
@@ -318,13 +507,31 @@ Resources:
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-lfs/*'
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-backups'
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-backups/*'
+              # Runtime reads any gitgateway secret (IdP config, mirror
+              # creds, Gemini key). Read is broad within the namespace;
+              # write is not granted here (R-11).
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                  - secretsmanager:PutSecretValue
-                  - secretsmanager:CreateSecret
                 Resource:
                   - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gitgateway/*'
+              # The admin "update AI key" flow writes exactly one secret.
+              # Grant write on only that secret rather than the whole
+              # namespace, and never CreateSecret (provisioned via IaC/CLI).
+              - Effect: Allow
+                Action:
+                  - secretsmanager:PutSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gitgateway/gemini-api-key-*'
+              # Use (not administer) the data CMK for S3/DynamoDB encryption.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource:
+                  - !GetAtt DataKey.Arn
               - Effect: Allow
                 Action:
                   - lambda:InvokeFunction
@@ -366,6 +573,8 @@ Resources:
           STACK_NAME_PREFIX: !Ref StackNamePrefix
           DOMAIN_NAME: !Ref DomainName
           IDP_URL: !Ref IdpUrl
+          GITGATEWAY_JWT_AUDIENCE: !Ref JwtAudience
+          ALLOWED_ORIGINS: !Sub 'https://${DomainName}'
           REPO_BUCKET: !Ref RepoBucket
           LFS_BUCKET: !Ref LfsBucket
           BACKUP_BUCKET: !Ref BackupBucket
@@ -410,6 +619,74 @@ Resources:
       StageName: $default
       AutoDeploy: true
 
+  # Edge Web Application Firewall in front of CloudFront (R-5). Uses AWS
+  # managed rule groups plus a rate-based rule. CLOUDFRONT-scope WebACLs
+  # must be created in us-east-1, which is where this stack is deployed.
+  # Note: WAF complements, and does not replace, the in-Lambda authn/authz.
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${StackNamePrefix}-web-acl'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${StackNamePrefix}-web-acl'
+      Rules:
+        - Name: AWSCommonRules
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${StackNamePrefix}-common-rules'
+        - Name: AWSKnownBadInputs
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${StackNamePrefix}-known-bad-inputs'
+        - Name: RateLimit
+          Priority: 2
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${StackNamePrefix}-rate-limit'
+
+  # Log group for WAF request logging. The log-group name must start with
+  # "aws-waf-logs-" for WAFv2 logging configuration to accept it.
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub 'aws-waf-logs-${StackNamePrefix}'
+      RetentionInDays: 365
+
+  WafLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !GetAtt WafLogGroup.Arn
+
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
     Properties:
@@ -417,6 +694,7 @@ Resources:
         Enabled: true
         Aliases:
           - !Ref DomainName
+        WebACLId: !GetAtt WebAcl.Arn
         ViewerCertificate:
           AcmCertificateArn: !Ref ACMCertificateARN
           SslSupportMethod: sni-only
@@ -470,14 +748,33 @@ Resources:
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-lfs/*'
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-backups'
                   - !Sub 'arn:aws:s3:::${StackNamePrefix}-backups/*'
+              # Backup reads metadata only; it never writes to the tables,
+              # so grant read-only actions scoped to the specific tables
+              # rather than a wildcard with write access (R-11).
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
-                  - dynamodb:PutItem
                   - dynamodb:Query
                   - dynamodb:Scan
                 Resource:
-                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${StackNamePrefix}-*'
+                  - !GetAtt ReposTable.Arn
+                  - !GetAtt AccessTable.Arn
+                  - !GetAtt PrsTable.Arn
+                  - !GetAtt CommentsTable.Arn
+                  - !GetAtt WebhooksTable.Arn
+                  - !GetAtt StatusChecksTable.Arn
+                  - !GetAtt AuditTable.Arn
+                  - !GetAtt NotificationsTable.Arn
+                  - !GetAtt EmbeddingsTable.Arn
+              # Decrypt source data and encrypt backup artifacts with the CMK.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                Resource:
+                  - !GetAtt DataKey.Arn
               - Effect: Allow
                 Action:
                   - sns:Publish

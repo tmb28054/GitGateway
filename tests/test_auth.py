@@ -252,6 +252,37 @@ class TestExtractPublicKeyFromMetadata:
         with pytest.raises(AuthError, match="Cannot parse certificate"):
             _extract_public_key_from_metadata(xml)
 
+    def test_extracts_from_full_namespaced_document(
+        self, rsa_keypair,
+    ) -> None:
+        """Extracts the cert from a full, namespaced metadata document."""
+        _, _, cert_der_b64 = rsa_keypair
+        xml = (
+            '<?xml version="1.0"?>'
+            "<md:EntityDescriptor "
+            "xmlns:md='urn:oasis:names:tc:SAML:2.0:metadata' "
+            "xmlns:ds='http://www.w3.org/2000/09/xmldsig#'>"
+            "<md:IDPSSODescriptor><md:KeyDescriptor><ds:KeyInfo>"
+            "<ds:X509Data>"
+            f"<ds:X509Certificate>{cert_der_b64}</ds:X509Certificate>"
+            "</ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"
+            "</md:IDPSSODescriptor></md:EntityDescriptor>"
+        )
+        result = _extract_public_key_from_metadata(xml)
+        assert "BEGIN PUBLIC KEY" in result
+
+    def test_raises_on_broken_xml(self) -> None:
+        """Truly malformed XML raises a Malformed AuthError."""
+        xml = "<ds:X509Certificate><unclosed>"
+        with pytest.raises(AuthError, match="Malformed"):
+            _extract_public_key_from_metadata(xml)
+
+    def test_ignores_empty_certificate_element(self) -> None:
+        """An empty X509Certificate element is treated as 'not found'."""
+        xml = "<ds:X509Certificate></ds:X509Certificate>"
+        with pytest.raises(AuthError, match="Cannot find"):
+            _extract_public_key_from_metadata(xml)
+
 
 class TestValidateJwt:
     """Tests for validate_jwt function."""
@@ -337,6 +368,107 @@ class TestValidateJwt:
             algorithms=["RS256"],
         )
         assert user.username == "dave"
+
+    def test_valid_audience_accepted(self, metadata_xml, rsa_keypair) -> None:
+        """A token with the expected audience passes validation."""
+        private_key_pem, _, _ = rsa_keypair
+
+        def fetch(url):
+            return metadata_xml
+
+        payload = {
+            "sub": "erin",
+            "iss": "https://idp.botthouse.net/metadata",
+            "aud": "gitgateway",
+            "exp": int(time.time()) + 3600,
+        }
+        token = pyjwt.encode(payload, private_key_pem, algorithm="RS256")
+        user = validate_jwt(
+            token, "https://idp.botthouse.net", fetch, audience="gitgateway",
+        )
+        assert user.username == "erin"
+
+    def test_wrong_audience_rejected(self, metadata_xml, rsa_keypair) -> None:
+        """A token whose audience does not match is rejected."""
+        private_key_pem, _, _ = rsa_keypair
+
+        def fetch(url):
+            return metadata_xml
+
+        payload = {
+            "sub": "erin",
+            "iss": "https://idp.botthouse.net/metadata",
+            "aud": "someone-else",
+            "exp": int(time.time()) + 3600,
+        }
+        token = pyjwt.encode(payload, private_key_pem, algorithm="RS256")
+        with pytest.raises(AuthError, match="audience"):
+            validate_jwt(
+                token, "https://idp.botthouse.net", fetch,
+                audience="gitgateway",
+            )
+
+    def test_audience_from_env(
+        self, metadata_xml, rsa_keypair, monkeypatch,
+    ) -> None:
+        """The expected audience falls back to GITGATEWAY_JWT_AUDIENCE."""
+        private_key_pem, _, _ = rsa_keypair
+        monkeypatch.setenv("GITGATEWAY_JWT_AUDIENCE", "gitgateway")
+
+        def fetch(url):
+            return metadata_xml
+
+        payload = {
+            "sub": "frank",
+            "iss": "https://idp.botthouse.net/metadata",
+            "aud": "gitgateway",
+            "exp": int(time.time()) + 3600,
+        }
+        token = pyjwt.encode(payload, private_key_pem, algorithm="RS256")
+        user = validate_jwt(token, "https://idp.botthouse.net", fetch)
+        assert user.username == "frank"
+
+    def test_admin_and_access_from_claims_array(
+        self, metadata_xml, rsa_keypair,
+    ) -> None:
+        """Admin/access are honored from the IdP's 'claims' array."""
+        private_key_pem, _, _ = rsa_keypair
+
+        def fetch(url):
+            return metadata_xml
+
+        payload = {
+            "sub": "topaz",
+            "iss": "https://idp.botthouse.net/metadata",
+            "exp": int(time.time()) + 3600,
+            "claims": ["gitgateway-admin", "gitgateway-access", "wiki-read"],
+        }
+        token = pyjwt.encode(payload, private_key_pem, algorithm="RS256")
+        user = validate_jwt(token, "https://idp.botthouse.net", fetch)
+        assert user.username == "topaz"
+        assert user.is_admin is True
+        assert user.has_access is True
+
+    def test_no_access_claim_denies_access(
+        self, metadata_xml, rsa_keypair,
+    ) -> None:
+        """A claims array without gitgateway-access yields has_access False."""
+        private_key_pem, _, _ = rsa_keypair
+
+        def fetch(url):
+            return metadata_xml
+
+        payload = {
+            "sub": "nolan",
+            "iss": "https://idp.botthouse.net/metadata",
+            "exp": int(time.time()) + 3600,
+            "gitgateway-access": False,
+            "claims": ["wiki-read"],
+        }
+        token = pyjwt.encode(payload, private_key_pem, algorithm="RS256")
+        user = validate_jwt(token, "https://idp.botthouse.net", fetch)
+        assert user.is_admin is False
+        assert user.has_access is False
 
 
 class TestParseBasicAuth:

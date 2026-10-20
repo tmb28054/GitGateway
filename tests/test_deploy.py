@@ -58,6 +58,7 @@ class TestBuildParameters:
         assert "CoreLayerArn" in keys
         assert "LintingLayerArn" in keys
         assert "BinariesLayerArn" in keys
+        assert "JwtAudience" in keys
 
         domain_param = next(
             p for p in params if p["ParameterKey"] == "DomainName"
@@ -68,6 +69,21 @@ class TestBuildParameters:
             p for p in params if p["ParameterKey"] == "CoreLayerArn"
         )
         assert core_param["ParameterValue"] == "arn:layer:core:1"
+
+        # Audience defaults to "git" to match the IdP.
+        aud_param = next(
+            p for p in params if p["ParameterKey"] == "JwtAudience"
+        )
+        assert aud_param["ParameterValue"] == "git"
+
+    def test_custom_jwt_audience(self) -> None:
+        """A custom jwt_audience is passed through to the parameter list."""
+        params = _build_parameters(
+            "d", "a", True, False, "b", "k", "",
+            jwt_audience="gitgateway",
+        )
+        aud = next(p for p in params if p["ParameterKey"] == "JwtAudience")
+        assert aud["ParameterValue"] == "gitgateway"
 
     def test_boolean_values(self) -> None:
         """Converts booleans to lowercase strings."""

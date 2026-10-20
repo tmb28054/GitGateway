@@ -113,27 +113,7 @@ def _extract_public_key_from_metadata(metadata_xml: str) -> str:
         PublicFormat,
     )
 
-    # Simple extraction — find X509Certificate content
-    start_tag = "<ds:X509Certificate>"
-    end_tag = "</ds:X509Certificate>"
-
-    # Try with namespace prefix
-    start_idx = metadata_xml.find(start_tag)
-    if start_idx == -1:
-        # Try without namespace prefix
-        start_tag = "<X509Certificate>"
-        end_tag = "</X509Certificate>"
-        start_idx = metadata_xml.find(start_tag)
-
-    if start_idx == -1:
-        raise AuthError("Cannot find X509Certificate in IdP metadata")
-
-    start_idx += len(start_tag)
-    end_idx = metadata_xml.find(end_tag, start_idx)
-    if end_idx == -1:
-        raise AuthError("Malformed X509Certificate in IdP metadata")
-
-    cert_b64 = metadata_xml[start_idx:end_idx].strip()
+    cert_b64 = _find_x509_certificate(metadata_xml)
 
     # Decode certificate and extract public key
     try:
@@ -150,19 +130,79 @@ def _extract_public_key_from_metadata(metadata_xml: str) -> str:
         ) from exc
 
 
+def _find_x509_certificate(metadata_xml: str) -> str:
+    """Locate the X509Certificate value in SAML metadata via XML parsing.
+
+    Uses defusedxml to parse the metadata safely (protecting against XXE
+    and entity-expansion attacks in externally fetched IdP metadata), then
+    searches for the first ``X509Certificate`` element regardless of its
+    namespace prefix.
+
+    Args:
+        metadata_xml: The raw metadata XML string.
+
+    Returns:
+        The base64 certificate body (whitespace-stripped).
+
+    Raises:
+        AuthError: If the XML is malformed or contains no certificate.
+    """
+    import re as _re  # pylint: disable=import-outside-toplevel
+
+    from defusedxml import ElementTree as SafeET  # pylint: disable=import-outside-toplevel
+
+    # Some real-world metadata (and the test fixtures) use the "ds:"/"md:"
+    # prefixes without declaring the namespaces on the parsed fragment, which
+    # a strict parser rejects. Strip any leading XML declaration and wrap the
+    # content in a root that declares the common SAML / XML-DSIG prefixes so
+    # the document parses safely (defusedxml still guards against XXE and
+    # entity-expansion). A genuinely malformed document raises AuthError.
+    body = _re.sub(r"^\s*<\?xml[^>]*\?>", "", metadata_xml).strip()
+    wrapper = (
+        "<gwroot "
+        "xmlns:ds='http://www.w3.org/2000/09/xmldsig#' "
+        "xmlns:md='urn:oasis:names:tc:SAML:2.0:metadata' "
+        "xmlns:saml='urn:oasis:names:tc:SAML:2.0:assertion'>"
+        f"{body}</gwroot>"
+    )
+    try:
+        root = SafeET.fromstring(wrapper)
+    except SafeET.ParseError as exc:
+        raise AuthError(
+            "Malformed X509Certificate in IdP metadata",
+        ) from exc
+
+    for element in root.iter():
+        # Strip any namespace: "{urn:...}X509Certificate" -> "X509Certificate".
+        tag = element.tag.rsplit("}", 1)[-1]
+        if tag == "X509Certificate" and element.text and element.text.strip():
+            return element.text.strip()
+
+    raise AuthError("Cannot find X509Certificate in IdP metadata")
+
+
 def validate_jwt(
     token: str,
     idp_url: str,
     fetch_func: Any = None,
     algorithms: list[str] | None = None,
+    audience: str | None = None,
 ) -> AuthenticatedUser:
     """Validate a JWT token and extract user information.
+
+    Verifies the signature (RS256), the issuer, and — when an audience is
+    configured — the ``aud`` claim. The expected audience is taken from the
+    ``audience`` argument, falling back to the ``GITGATEWAY_JWT_AUDIENCE``
+    environment variable. Audience verification is only skipped when neither
+    is set, so a deployment that configures an audience gets full validation.
 
     Args:
         token: The raw JWT token string.
         idp_url: The base URL of the identity provider.
         fetch_func: Optional callable for fetching URL content (for testing).
         algorithms: Allowed signing algorithms. Defaults to RS256.
+        audience: Expected ``aud`` claim. Defaults to the
+            ``GITGATEWAY_JWT_AUDIENCE`` env var when not provided.
 
     Returns:
         An AuthenticatedUser with extracted claims.
@@ -170,23 +210,35 @@ def validate_jwt(
     Raises:
         AuthError: If the token is invalid, expired, or malformed.
     """
+    import os  # pylint: disable=import-outside-toplevel
+
     if algorithms is None:
         algorithms = ["RS256"]
 
+    if audience is None:
+        audience = os.environ.get("GITGATEWAY_JWT_AUDIENCE", "").strip() or None
+
     public_key_pem = get_idp_public_key(idp_url, fetch_func)
 
+    decode_kwargs: dict[str, Any] = {
+        "algorithms": algorithms,
+        "issuer": f"{idp_url}/metadata",
+    }
+    if audience:
+        decode_kwargs["audience"] = audience
+    else:
+        # No audience configured for this deployment: skip aud verification
+        # rather than reject tokens that legitimately omit the claim.
+        decode_kwargs["options"] = {"verify_aud": False}
+
     try:
-        payload = jwt.decode(
-            token,
-            public_key_pem,
-            algorithms=algorithms,
-            issuer=f"{idp_url}/metadata",
-            options={"verify_aud": False},
-        )
+        payload = jwt.decode(token, public_key_pem, **decode_kwargs)
     except jwt.ExpiredSignatureError as exc:
         raise AuthError("Token has expired") from exc
     except jwt.InvalidIssuerError as exc:
         raise AuthError("Invalid token issuer") from exc
+    except jwt.InvalidAudienceError as exc:
+        raise AuthError("Invalid token audience") from exc
     except jwt.InvalidTokenError as exc:
         raise AuthError(f"Invalid token: {exc}") from exc
 
@@ -194,8 +246,18 @@ def validate_jwt(
     if not username:
         raise AuthError("Token missing 'sub' claim")
 
-    is_admin = bool(payload.get("gitgateway-admin", False))
-    has_access = bool(payload.get("gitgateway-access", True))
+    # The IdP conveys authorization as entries in a "claims" array
+    # (e.g. "gitgateway-admin", "gitgateway-access"). Older tokens may instead
+    # carry top-level boolean claims, so honor both forms.
+    claims = payload.get("claims", [])
+    claims_list = claims if isinstance(claims, list) else []
+    is_admin = bool(payload.get("gitgateway-admin", False)) or (
+        "gitgateway-admin" in claims_list
+    )
+    if "gitgateway-access" in claims_list:
+        has_access = True
+    else:
+        has_access = bool(payload.get("gitgateway-access", True))
 
     return AuthenticatedUser(
         username=username,

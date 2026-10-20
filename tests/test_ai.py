@@ -81,10 +81,18 @@ class TestCallGemini:
         }
         mock_response.raise_for_status = MagicMock()
 
-        with patch("gitgateway.ai.requests.post", return_value=mock_response):
+        with patch(
+            "gitgateway.ai.requests.post", return_value=mock_response,
+        ) as post:
             result = call_gemini("test prompt", config, "team/app")
 
         assert result == "Generated summary"
+        # The API key must travel in a header, never in the URL/query string.
+        _pos_args, kwargs = post.call_args
+        url = post.call_args[0][0] if _pos_args else kwargs.get("url", "")
+        assert "test-key" not in url
+        assert "key=" not in url
+        assert kwargs["headers"]["x-goog-api-key"] == "test-key"
 
     def test_disabled_raises(self) -> None:
         """Raises when AI is disabled."""

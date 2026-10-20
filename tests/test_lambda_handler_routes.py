@@ -15,11 +15,33 @@ import boto3
 import pytest
 from moto import mock_aws
 
+from gitgateway.auth import AuthenticatedUser, create_session_cookie
 from gitgateway.lambda_handler import (
     Request,
     _get_page_content,
     _handle_api,
 )
+
+# Default signing secret matches _get_session_user's fallback.
+_SESSION_SECRET = "gitgateway-session-secret"
+
+
+def _admin_cookie() -> str:
+    """Build a valid signed session cookie for an admin user."""
+    value = create_session_cookie(
+        AuthenticatedUser(username="admin", is_admin=True),
+        _SESSION_SECRET,
+    )
+    return f"session={value}"
+
+
+def _non_admin_cookie(username: str = "bob") -> str:
+    """Build a valid signed session cookie for a non-admin user."""
+    value = create_session_cookie(
+        AuthenticatedUser(username=username, is_admin=False),
+        _SESSION_SECRET,
+    )
+    return f"session={value}"
 
 TABLE_SUFFIXES = [
     "repos",
@@ -62,13 +84,26 @@ def aws():
 
 
 def _req(method: str, path: str, body: dict | None = None,
-         query_string: str = "", headers: dict | None = None) -> Request:
-    """Build a Request for the API handler."""
+         query_string: str = "", headers: dict | None = None,
+         authed: bool = True) -> Request:
+    """Build a Request for the API handler.
+
+    Attaches a valid admin session cookie by default so the API
+    authentication/authorization gate is satisfied. Pass ``authed=False``
+    to build an unauthenticated request (for testing the gate), or pass
+    explicit ``headers`` (e.g. a non-admin session) to override the cookie.
+    """
+    if headers is not None:
+        req_headers = dict(headers)
+    elif authed:
+        req_headers = {"cookie": _admin_cookie()}
+    else:
+        req_headers = {}
     return Request(
         method=method,
         path=path,
         query_string=query_string,
-        headers=headers or {},
+        headers=req_headers,
         body=json.dumps(body).encode() if body is not None else b"",
     )
 
@@ -388,7 +423,9 @@ class TestApiTokens:
 
     def test_create_token_requires_auth(self, aws) -> None:
         """POST /api/tokens without a session returns 401."""
-        resp = _handle_api(_req("POST", "/api/tokens", {"description": "x"}))
+        resp = _handle_api(_req(
+            "POST", "/api/tokens", {"description": "x"}, authed=False,
+        ))
         assert resp.status_code == 401
 
     def test_create_and_list_token(self, aws) -> None:
@@ -410,7 +447,7 @@ class TestApiTokens:
 
     def test_list_tokens_requires_auth(self, aws) -> None:
         """GET /api/tokens without a session returns 401."""
-        resp = _handle_api(_req("GET", "/api/tokens"))
+        resp = _handle_api(_req("GET", "/api/tokens", authed=False))
         assert resp.status_code == 401
 
     def test_create_token_invalid_scope_defaults(self, aws) -> None:
@@ -446,7 +483,9 @@ class TestApiTokens:
 
     def test_revoke_token_requires_auth(self, aws) -> None:
         """DELETE /api/tokens/<id> without a session returns 401."""
-        resp = _handle_api(_req("DELETE", "/api/tokens/deadbeef"))
+        resp = _handle_api(_req(
+            "DELETE", "/api/tokens/deadbeef", authed=False,
+        ))
         assert resp.status_code == 401
 
 
@@ -727,6 +766,9 @@ class TestLfsHandler:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw_user(),
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ):
             created = _handle_lfs(_req(
                 "POST", f"{base}/locks", {"path": "big.bin"},
@@ -747,7 +789,12 @@ class TestLfsHandler:
             assert unlocked.status_code == 200
 
     def test_lock_create_read_only_forbidden(self) -> None:
-        """A read-only token cannot create a lock."""
+        """A read-scope token cannot create a lock even with repo access.
+
+        _authorize_repo_access is satisfied (the user has contributor RBAC),
+        so the request reaches the token-scope check, which rejects the
+        read-only credential.
+        """
         from unittest.mock import patch
 
         from gitgateway.lambda_handler import _handle_lfs
@@ -755,6 +802,9 @@ class TestLfsHandler:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value={"username": "alice", "scope": "read"},
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ):
             resp = _handle_lfs(_req(
                 "POST", "/team/app.git/info/lfs/locks", {"path": "x"},
@@ -762,7 +812,7 @@ class TestLfsHandler:
         assert resp.status_code == 403
 
     def test_batch_upload_read_only_forbidden(self) -> None:
-        """A read-only token cannot use batch upload."""
+        """A read-scope token cannot use batch upload despite repo access."""
         from unittest.mock import patch
 
         from gitgateway.lambda_handler import _handle_lfs
@@ -770,6 +820,9 @@ class TestLfsHandler:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value={"username": "alice", "scope": "read"},
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ):
             resp = _handle_lfs(_req(
                 "POST", "/team/app.git/info/lfs/objects/batch",
@@ -778,7 +831,7 @@ class TestLfsHandler:
         assert resp.status_code == 403
 
     def test_unlock_read_only_forbidden(self) -> None:
-        """A read-only token cannot unlock."""
+        """A read-scope token cannot unlock despite repo access."""
         from unittest.mock import patch
 
         from gitgateway.lambda_handler import _handle_lfs
@@ -786,6 +839,9 @@ class TestLfsHandler:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value={"username": "alice", "scope": "read"},
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ):
             resp = _handle_lfs(_req(
                 "POST", "/team/app.git/info/lfs/locks/abc/unlock",
@@ -803,6 +859,9 @@ class TestLfsHandler:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw_user(),
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ):
             resp = _handle_lfs(_req(
                 "POST", "/team/app.git/info/lfs/locks/nope/unlock",
@@ -821,6 +880,9 @@ class TestLfsHandler:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw_user(),
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ):
             first = _handle_lfs(_req("POST", f"{base}/locks", {"path": "x"}))
             assert first.status_code == 201
@@ -836,6 +898,9 @@ class TestLfsHandler:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw_user(),
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ), patch(
             "gitgateway.lfs.handle_batch_request",
             return_value={"objects": []},
@@ -858,6 +923,9 @@ class TestLfsHandler:
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw_user(),
         ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
+        ), patch(
             "gitgateway.lfs.handle_batch_request",
             side_effect=LfsError("nope", status_code=422),
         ):
@@ -876,6 +944,9 @@ class TestLfsHandler:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw_user(),
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ):
             resp = _handle_lfs(_req(
                 "GET", "/team/app.git/info/lfs/bogus",
@@ -932,6 +1003,15 @@ class TestWebRenderHelpers:
         ):
             assert _get_request_username(_req("GET", "/")) == ""
 
+    def test_request_username_unknown_maps_to_empty(self) -> None:
+        """The 'unknown' session sentinel maps to an empty username."""
+        from gitgateway.lambda_handler import _get_request_username
+
+        # An unauthenticated request yields the 'unknown' sentinel, which
+        # _get_request_username normalizes to "" so callers treat it as
+        # unauthenticated rather than a user named 'unknown'.
+        assert _get_request_username(_req("GET", "/", authed=False)) == ""
+
     def test_render_web_page_admin_nav(self, aws) -> None:
         """An admin user sees the Admin nav link."""
         from gitgateway.lambda_handler import _render_web_page
@@ -972,6 +1052,9 @@ class TestDispatchGit:
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw(),
         ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
+        ), patch(
             "gitgateway.git_backend.handle_git_http_request",
             return_value=(200, "application/x-git-upload-pack-result", b"ok"),
         ):
@@ -1002,6 +1085,9 @@ class TestDispatchGit:
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw(),
         ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
+        ), patch(
             "gitgateway.git_backend.handle_git_http_request",
             return_value=(200, "application/x-git-receive-pack-result", b"k"),
         ), patch(
@@ -1020,6 +1106,9 @@ class TestDispatchGit:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value=self._rw(),
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ), patch(
             "gitgateway.git_backend.handle_git_http_request",
             return_value=(200, "application/x-git-receive-pack-result", b"k"),
@@ -1056,7 +1145,7 @@ class TestDispatchWeb:
             {"IDP_URL": "https://idp.example.com",
              "DOMAIN_NAME": "git.example.com"},
         ):
-            resp = _dispatch("web", _req("GET", "/"))
+            resp = _dispatch("web", _req("GET", "/", authed=False))
         assert resp.status_code == 302
         assert "idp.example.com" in resp.headers["Location"]
 
@@ -1140,27 +1229,28 @@ class TestParseEventAndAuthCallback:
         assert resp.headers["Location"] == "/"
         assert "session=" in resp.headers["Set-Cookie"]
 
-    def test_auth_callback_invalid_jwt_falls_back(self, aws) -> None:
-        """An invalid JWT falls back to unverified decode and still sets a
-        session (current lenient behavior)."""
+    def test_auth_callback_invalid_jwt_rejected(self, aws) -> None:
+        """An invalid JWT is rejected with 401 and no session is issued."""
         from gitgateway.lambda_handler import _handle_auth_callback
 
-        # validate_jwt raises; pyjwt unverified decode also fails on a
-        # non-JWT string, so the handler falls back to an "unknown" user.
+        # A non-JWT string fails strict validation; the handler must NOT fall
+        # back to issuing a session from an unverified token.
         resp = _handle_auth_callback(
             _req("GET", "/auth/callback", query_string="token=not-a-jwt"),
             "https://idp.example.com",
         )
-        assert resp.status_code == 302
+        assert resp.status_code == 401
+        assert "Set-Cookie" not in resp.headers
+        assert "Sign-in failed" in resp.body
 
-    def test_auth_callback_unverified_decode_fallback(self, aws) -> None:
-        """A signed-invalid but decodable JWT falls back to its claims."""
+    def test_auth_callback_unverified_token_rejected(self, aws) -> None:
+        """A signed-but-unverifiable JWT is rejected, not trusted by claims."""
         import jwt as pyjwt
 
         from gitgateway.lambda_handler import _handle_auth_callback
 
-        # A validly-structured JWT that fails signature validation but
-        # decodes (verify_signature=False) to recover sub/claims.
+        # A structurally valid JWT whose signature cannot be verified against
+        # the IdP key must be rejected (previously it was wrongly trusted).
         token = pyjwt.encode(
             {"sub": "carol", "claims": ["gitgateway-admin"]},
             "some-secret",
@@ -1170,8 +1260,60 @@ class TestParseEventAndAuthCallback:
             _req("GET", "/auth/callback", query_string=f"token={token}"),
             "https://idp.example.com",
         )
+        assert resp.status_code == 401
+        assert "Set-Cookie" not in resp.headers
+
+    def test_auth_callback_no_token_serves_bootstrap(self, aws) -> None:
+        """No query token serves the fragment-recovery bootstrap page."""
+        from gitgateway.lambda_handler import _handle_auth_callback
+
+        resp = _handle_auth_callback(
+            _req("GET", "/auth/callback"), "https://idp.example.com",
+        )
+        assert resp.status_code == 200
+        assert "location.hash" in resp.body
+        # The bootstrap POSTs the recovered token (keeps it out of the URL).
+        assert "method='post'" in resp.body
+        assert "action='/auth/callback'" in resp.body
+
+    def test_auth_callback_post_token_success(self, aws) -> None:
+        """A valid token POSTed as form data creates a session."""
+        from gitgateway.auth import AuthenticatedUser
+        from gitgateway.lambda_handler import _handle_auth_callback
+
+        req = _req("POST", "/auth/callback")
+        req.body = b"token=jwt.tok.en"
+        with patch(
+            "gitgateway.auth.validate_jwt",
+            return_value=AuthenticatedUser(username="alice", is_admin=True),
+        ):
+            resp = _handle_auth_callback(req, "https://idp.example.com")
         assert resp.status_code == 302
         assert "session=" in resp.headers["Set-Cookie"]
+
+    def test_auth_callback_post_empty_body_400(self, aws) -> None:
+        """A POST with an empty body returns 400."""
+        from gitgateway.lambda_handler import _handle_auth_callback
+
+        req = _req("POST", "/auth/callback")
+        req.body = b""
+        resp = _handle_auth_callback(req, "https://idp.example.com")
+        assert resp.status_code == 400
+        assert "Missing token parameter" in resp.body
+
+    def test_auth_callback_post_body_without_token_400(self, aws) -> None:
+        """A POST body present but lacking a token key returns 400.
+
+        Exercises the fall-through from the body parser to the (empty) query
+        string when the form carries unrelated fields.
+        """
+        from gitgateway.lambda_handler import _handle_auth_callback
+
+        req = _req("POST", "/auth/callback")
+        req.body = b"other=value"
+        resp = _handle_auth_callback(req, "https://idp.example.com")
+        assert resp.status_code == 400
+        assert "Missing token parameter" in resp.body
 
 
 class TestGitAuthAndHelpers:
@@ -1268,7 +1410,7 @@ class TestGitAuthAndHelpers:
         """No credentials means not authenticated."""
         from gitgateway.lambda_handler import _is_authenticated
 
-        assert _is_authenticated(_req("GET", "/")) is False
+        assert _is_authenticated(_req("GET", "/", authed=False)) is False
 
     def test_trigger_post_push_no_prs(self, aws) -> None:
         """Post-push trigger with no open PRs returns quietly."""
@@ -2810,15 +2952,27 @@ class TestApiRoutingEdges:
         assert json.loads(resp.body)["default_branch"] == "develop"
 
     def test_post_tokens_invalid_json(self, aws) -> None:
-        """POST /api/tokens with bad JSON falls back to empty body.
-
-        The JSON decode error is swallowed (body becomes {}), then the
-        missing session yields a 401 during the auth check.
-        """
-        req = _req("POST", "/api/tokens")
+        """POST /api/tokens without a session is rejected by the gate (401)."""
+        req = _req("POST", "/api/tokens", authed=False)
         req.body = b"{not json"
         resp = _handle_api(req)
         assert resp.status_code == 401
+
+    def test_post_tokens_invalid_json_authenticated(self, aws) -> None:
+        """POST /api/tokens with bad JSON but a valid session succeeds.
+
+        Once past the authentication gate, the token route swallows the
+        JSON decode error (body becomes {}) and creates a token with
+        default fields, exercising the decode-fallback branch.
+        """
+        req = _req(
+            "POST", "/api/tokens",
+            headers={"cookie": _non_admin_cookie("alice")},
+        )
+        req.body = b"{not json"
+        resp = _handle_api(req)
+        assert resp.status_code == 201
+        assert json.loads(resp.body)["token"].startswith("gg_")
 
     def test_post_access_invalid_level(self, aws) -> None:
         """POST /api/access with an invalid level returns 400."""
@@ -2872,7 +3026,9 @@ class TestGitAuthAndLfsEdges:
         with patch.dict("os.environ", {"IDP_URL": "https://idp.example.com"}), \
                 patch(
                     "gitgateway.auth.validate_jwt",
-                    return_value=SimpleNamespace(username="alice"),
+                    return_value=SimpleNamespace(
+                        username="alice", has_access=True,
+                    ),
                 ):
             user = _authenticate_git_request(req)
         assert user == {"username": "alice", "scope": "read/write"}
@@ -2900,6 +3056,9 @@ class TestGitAuthAndLfsEdges:
         with patch(
             "gitgateway.lambda_handler._authenticate_git_request",
             return_value={"username": "alice", "scope": "read/write"},
+        ), patch(
+            "gitgateway.lambda_handler._authorize_repo_access",
+            return_value=True,
         ), patch(
             "gitgateway.lfs.handle_batch_request",
             return_value={"objects": []},
@@ -3941,3 +4100,253 @@ class TestFormatBytes:
         )
 
         assert _format_bytes(5 * 1024 ** 4).endswith("TB")
+
+
+class TestDataPlaneAuthorization:
+    """R-1/R-2/R-4: per-repo RBAC on the git and LFS data planes.
+
+    These tests exercise the real _authorize_repo_access gate against
+    moto-backed DynamoDB (no patching of the gate), verifying that
+    check_permission is now enforced on clone/fetch, push, and LFS.
+    """
+
+    @staticmethod
+    def _rw(username: str = "alice") -> dict:
+        return {"username": username, "scope": "read/write"}
+
+    @staticmethod
+    def _grant(resource: str, level: str, username: str = "alice") -> None:
+        """Grant a user access at a group or repo resource."""
+        _handle_api(_req("POST", "/api/access", {
+            "username": username, "resource": resource, "level": level,
+        }))
+
+    def test_fetch_denied_without_access(self, aws) -> None:
+        """A fetch by a user with no access entry is refused with 403."""
+        from gitgateway.lambda_handler import _dispatch
+
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=self._rw(),
+        ), patch(
+            "gitgateway.git_backend.handle_git_http_request",
+            return_value=(200, "x", b"should-not-run"),
+        ) as backend:
+            resp = _dispatch("git", _req(
+                "POST", "/team/app.git/git-upload-pack",
+            ))
+        assert resp.status_code == 403
+        backend.assert_not_called()
+
+    def test_fetch_allowed_with_readonly(self, aws) -> None:
+        """A readonly grant is sufficient to fetch/clone."""
+        from gitgateway.lambda_handler import _dispatch
+
+        self._grant("team", "readonly")
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=self._rw(),
+        ), patch(
+            "gitgateway.git_backend.handle_git_http_request",
+            return_value=(200, "x", b"ok"),
+        ):
+            resp = _dispatch("git", _req(
+                "POST", "/team/app.git/git-upload-pack",
+            ))
+        assert resp.status_code == 200
+
+    def test_push_denied_with_only_readonly(self, aws) -> None:
+        """A readonly grant cannot push (needs contributor)."""
+        from gitgateway.lambda_handler import _dispatch
+
+        self._grant("team", "readonly")
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=self._rw(),
+        ), patch(
+            "gitgateway.git_backend.handle_git_http_request",
+            return_value=(200, "x", b"nope"),
+        ) as backend:
+            resp = _dispatch("git", _req(
+                "POST", "/team/app.git/git-receive-pack",
+            ))
+        assert resp.status_code == 403
+        backend.assert_not_called()
+
+    def test_push_allowed_with_contributor(self, aws) -> None:
+        """A contributor grant permits push."""
+        from gitgateway.lambda_handler import _dispatch
+
+        self._grant("team", "contributor")
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=self._rw(),
+        ), patch(
+            "gitgateway.git_backend.handle_git_http_request",
+            return_value=(200, "x", b"ok"),
+        ), patch(
+            "gitgateway.lambda_handler._trigger_post_push_linting",
+        ):
+            resp = _dispatch("git", _req(
+                "POST", "/team/app.git/git-receive-pack",
+            ))
+        assert resp.status_code == 200
+
+    def test_lfs_download_denied_without_access(self, aws) -> None:
+        """An LFS batch download is refused without repo access."""
+        from gitgateway.lambda_handler import _handle_lfs
+
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=self._rw(),
+        ):
+            resp = _handle_lfs(_req(
+                "POST", "/team/app.git/info/lfs/objects/batch",
+                {"operation": "download", "objects": []},
+            ))
+        assert resp.status_code == 403
+
+    def test_lfs_download_allowed_with_readonly(self, aws) -> None:
+        """A readonly grant permits an LFS batch download."""
+        from gitgateway.lambda_handler import _handle_lfs
+
+        self._grant("team", "readonly")
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=self._rw(),
+        ), patch(
+            "gitgateway.lfs.handle_batch_request",
+            return_value={"objects": []},
+        ):
+            resp = _handle_lfs(_req(
+                "POST", "/team/app.git/info/lfs/objects/batch",
+                {"operation": "download", "objects": []},
+            ))
+        assert resp.status_code == 200
+
+    def test_lfs_upload_denied_with_only_readonly(self, aws) -> None:
+        """A readonly grant cannot use LFS upload (needs contributor)."""
+        from gitgateway.lambda_handler import _handle_lfs
+
+        self._grant("team", "readonly")
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=self._rw(),
+        ):
+            resp = _handle_lfs(_req(
+                "POST", "/team/app.git/info/lfs/objects/batch",
+                {"operation": "upload", "objects": []},
+            ))
+        assert resp.status_code == 403
+
+
+class TestAuthorizeRepoAccessHelper:
+    """Unit tests for the _authorize_repo_access fail-closed helper."""
+
+    def test_empty_username_denied(self) -> None:
+        """A missing username is denied without touching the database."""
+        from gitgateway.lambda_handler import _authorize_repo_access
+        from gitgateway.models import AccessLevel
+
+        assert _authorize_repo_access(
+            "", "team", "app", AccessLevel.READONLY,
+        ) is False
+
+    def test_check_permission_exception_fails_closed(self) -> None:
+        """An error resolving permissions denies access (fail closed)."""
+        from gitgateway.lambda_handler import _authorize_repo_access
+        from gitgateway.models import AccessLevel
+
+        with patch(
+            "gitgateway.db.check_permission",
+            side_effect=RuntimeError("dynamo down"),
+        ):
+            allowed = _authorize_repo_access(
+                "alice", "team", "app", AccessLevel.READONLY,
+            )
+        assert allowed is False
+
+
+class TestApiAuthorizationGate:
+    """R-3: authentication + admin authorization on the API surface."""
+
+    def test_unauthenticated_mutation_rejected(self, aws) -> None:
+        """An unauthenticated group create is rejected with 401."""
+        resp = _handle_api(_req(
+            "POST", "/api/groups", {"name": "team"}, authed=False,
+        ))
+        assert resp.status_code == 401
+
+    def test_non_admin_mutation_forbidden(self, aws) -> None:
+        """An authenticated non-admin cannot create a group (403)."""
+        headers = {"cookie": _non_admin_cookie()}
+        resp = _handle_api(_req(
+            "POST", "/api/groups", {"name": "team"}, headers=headers,
+        ))
+        assert resp.status_code == 403
+
+    def test_non_admin_can_use_token_route(self, aws) -> None:
+        """A non-admin authenticated user may manage their own tokens."""
+        headers = {"cookie": _non_admin_cookie("alice")}
+        resp = _handle_api(_req(
+            "POST", "/api/tokens", {"description": "laptop"},
+            headers=headers,
+        ))
+        assert resp.status_code == 201
+
+    def test_admin_route_classification(self) -> None:
+        """_is_admin_api_route flags admin routes and clears the rest."""
+        from gitgateway.lambda_handler import _is_admin_api_route
+
+        assert _is_admin_api_route("/api/groups", "POST") is True
+        assert _is_admin_api_route("/api/groups/team", "DELETE") is True
+        assert _is_admin_api_route("/api/access", "DELETE") is True
+        assert _is_admin_api_route(
+            "/api/repos/team/app/branches", "POST",
+        ) is True
+        assert _is_admin_api_route("/api/admin/ai-key", "POST") is True
+        # Non-admin routes:
+        assert _is_admin_api_route("/api/groups", "GET") is False
+        assert _is_admin_api_route("/api/tokens", "POST") is False
+        assert _is_admin_api_route("/api/team/app/pulls", "POST") is False
+
+
+@pytest.mark.smoke
+class TestDataPlaneAuthorizationSmoke:
+    """Smoke: the git data-plane RBAC gate denies and allows correctly."""
+
+    def test_smoke_authz_gate_denies_and_allows(self, aws) -> None:
+        """A user with no access is denied; a contributor is allowed."""
+        from gitgateway.lambda_handler import _dispatch
+
+        rw = {"username": "alice", "scope": "read/write"}
+
+        # No access entry -> fail-closed 403 and the backend never runs.
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=rw,
+        ), patch(
+            "gitgateway.git_backend.handle_git_http_request",
+            return_value=(200, "x", b"denied"),
+        ) as backend:
+            denied = _dispatch("git", _req(
+                "POST", "/team/app.git/git-upload-pack",
+            ))
+        assert denied.status_code == 403
+        backend.assert_not_called()
+
+        # Grant readonly, then the same fetch succeeds.
+        _handle_api(_req("POST", "/api/access", {
+            "username": "alice", "resource": "team", "level": "readonly",
+        }))
+        with patch(
+            "gitgateway.lambda_handler._authenticate_git_request",
+            return_value=rw,
+        ), patch(
+            "gitgateway.git_backend.handle_git_http_request",
+            return_value=(200, "x", b"ok"),
+        ):
+            allowed = _dispatch("git", _req(
+                "POST", "/team/app.git/git-upload-pack",
+            ))
+        assert allowed.status_code == 200

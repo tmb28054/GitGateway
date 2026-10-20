@@ -253,6 +253,20 @@ class TestDeployCommand:
         assert output["acm_certificate_arn"] == "arn:aws:acm:us-east-1:123:cert/abc"
         assert output["region"] == "eu-west-1"
         assert output["profile"] == "prod"
+        # Defaults to the IdP's audience when not overridden.
+        assert output["jwt_audience"] == "git"
+
+    def test_deploy_custom_jwt_audience(self, capsys) -> None:
+        """The --jwt-audience flag overrides the default."""
+        result = main([
+            "deploy",
+            "--domain-name", "git.example.com",
+            "--acm-certificate-arn", "arn:aws:acm:us-east-1:123:cert/abc",
+            "--jwt-audience", "gitgateway",
+        ])
+        assert result == 0
+        output = json.loads(capsys.readouterr().out)
+        assert output["jwt_audience"] == "gitgateway"
 
 
 class TestApiUrl:

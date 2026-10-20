@@ -148,6 +148,10 @@ def _build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-loca
     )
     deploy_parser.add_argument("--region", default="us-east-1")
     deploy_parser.add_argument("--profile", help="AWS profile")
+    deploy_parser.add_argument(
+        "--jwt-audience", default="git",
+        help="Expected JWT 'aud' claim from the IdP (default: git)",
+    )
     deploy_parser.set_defaults(func=_handle_deploy)
 
     return parser
@@ -371,6 +375,7 @@ def _handle_deploy(args: argparse.Namespace) -> int:
         "acm_certificate_arn": args.acm_certificate_arn,
         "region": args.region,
         "profile": args.profile,
+        "jwt_audience": args.jwt_audience,
     })
     return 0
 

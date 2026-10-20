@@ -581,6 +581,7 @@ def deploy_stack(  # pylint: disable=too-many-positional-arguments,too-many-loca
     enable_codebuild: bool = True,
     enable_ai: bool = False,
     idp_url: str = "",
+    jwt_audience: str = "git",
 ) -> dict:
     """Deploy or update the GitGateway CloudFormation stack.
 
@@ -597,6 +598,7 @@ def deploy_stack(  # pylint: disable=too-many-positional-arguments,too-many-loca
         enable_codebuild: Whether to enable CodeBuild integration.
         enable_ai: Whether to enable AI features.
         idp_url: Identity provider URL for OAuth.
+        jwt_audience: Expected JWT 'aud' claim from the IdP (default 'git').
 
     Returns:
         Dictionary of mapped stack outputs.
@@ -665,6 +667,7 @@ def deploy_stack(  # pylint: disable=too-many-positional-arguments,too-many-loca
         linting_layer_arn=linting_layer_arn,
         binaries_layer_arn=binaries_layer_arn,
         backup_source_key=backup_source_key,
+        jwt_audience=jwt_audience,
     )
 
     kwargs = {
@@ -794,6 +797,7 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
     linting_layer_arn: str = "",
     binaries_layer_arn: str = "",
     backup_source_key: str = BACKUP_SOURCE_KEY,
+    jwt_audience: str = "git",
 ) -> list[dict]:
     """Build CloudFormation parameters list.
 
@@ -809,6 +813,7 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
         linting_layer_arn: ARN of the linting dependencies layer.
         binaries_layer_arn: ARN of the binary tools layer.
         backup_source_key: S3 key of the backup CodeBuild source zip.
+        jwt_audience: Expected JWT 'aud' claim from the IdP.
 
     Returns:
         List of parameter dicts for CloudFormation.
@@ -838,6 +843,10 @@ def _build_parameters(  # pylint: disable=too-many-positional-arguments
         {
             "ParameterKey": "IdpUrl",
             "ParameterValue": idp_url,
+        },
+        {
+            "ParameterKey": "JwtAudience",
+            "ParameterValue": jwt_audience,
         },
         {
             "ParameterKey": "CoreLayerArn",

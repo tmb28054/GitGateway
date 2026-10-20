@@ -21,6 +21,10 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from gitgateway.models import AccessLevel
 
 LOG = logging.getLogger(__name__)
 
@@ -199,23 +203,65 @@ def error_response(
     )
 
 
-def cors_headers() -> dict[str, str]:
+def _allowed_origins() -> list[str]:
+    """Resolve the CORS origin allowlist for this deployment.
+
+    Sourced from the ALLOWED_ORIGINS env var (comma-separated). Falls back
+    to the deployment's own custom domain (DOMAIN_NAME) when set. Returns an
+    empty list when neither is configured, in which case no cross-origin
+    access is granted.
+
+    Returns:
+        List of allowed origin strings (e.g. "https://git.example.com").
+    """
+    import os  # pylint: disable=import-outside-toplevel
+
+    raw = os.environ.get("ALLOWED_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+
+    domain = os.environ.get("DOMAIN_NAME", "").strip()
+    if domain:
+        return [f"https://{domain}"]
+
+    return []
+
+
+def cors_headers(request: Request | None = None) -> dict[str, str]:
     """Generate CORS headers for API responses.
+
+    Reflects the request's Origin only when it appears in the configured
+    allowlist, rather than returning a wildcard. When the origin is not
+    allowed (or absent), no Access-Control-Allow-Origin header is emitted,
+    so the browser blocks the cross-origin response.
+
+    Args:
+        request: The originating request, used to read the Origin header.
 
     Returns:
         Dictionary of CORS headers.
     """
-    return {
-        "Access-Control-Allow-Origin": "*",
+    headers = {
         "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": (
             "Content-Type, Authorization, X-Requested-With"
         ),
         "Access-Control-Max-Age": "86400",
+        "Vary": "Origin",
     }
 
+    origin = ""
+    if request is not None:
+        origin = request.headers.get("origin", "")
 
-def handle_options(request: Request) -> Response:  # pylint: disable=unused-argument
+    if origin and origin in _allowed_origins():
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+
+    return headers
+
+
+def handle_options(request: Request) -> Response:
     """Handle CORS preflight OPTIONS request.
 
     Args:
@@ -226,7 +272,7 @@ def handle_options(request: Request) -> Response:  # pylint: disable=unused-argu
     """
     return Response(
         status_code=204,
-        headers=cors_headers(),
+        headers=cors_headers(request),
     )
 
 
@@ -309,12 +355,30 @@ def _dispatch(handler_name: str, request: Request) -> Response:
                 },
             )
 
-        # Check access: push requires read/write scope
+        # Determine the operation and enforce per-repo RBAC (fail-closed).
+        # Push requires CONTRIBUTOR; clone/fetch requires READONLY. This gate
+        # applies to every git operation, not just pushes.
+        from gitgateway.models import AccessLevel  # pylint: disable=import-outside-toplevel
         is_push = "git-receive-pack" in git_path
+        required_level = (
+            AccessLevel.CONTRIBUTOR if is_push else AccessLevel.READONLY
+        )
+
+        # A read-only credential can never push, regardless of RBAC.
         if is_push and git_user.get("scope") == "read":
             return Response(
                 status_code=403,
                 body=b"Token scope is read-only; push requires read/write",
+                headers={"Content-Type": "text/plain"},
+            )
+
+        # Per-repo/per-group authorization check.
+        if not _authorize_repo_access(
+            git_user.get("username", ""), group, repo_name, required_level,
+        ):
+            return Response(
+                status_code=403,
+                body=b"Access denied for this repository",
                 headers={"Content-Type": "text/plain"},
             )
 
@@ -380,6 +444,42 @@ def _dispatch(handler_name: str, request: Request) -> Response:
     return _render_web_page(request, user_info)
 
 
+def _is_admin_api_route(path: str, method: str) -> bool:
+    """Return True if an API route requires an admin session.
+
+    Administrative routes manage groups, access control, branch
+    registration, and platform secrets. Token, pull-request, and
+    read-listing routes are excluded — they are available to any
+    authenticated user and enforce their own per-user ownership checks.
+
+    Args:
+        path: The request path.
+        method: The HTTP method.
+
+    Returns:
+        True if the route requires admin privilege.
+    """
+    # Group management: create/delete (listing is allowed for any user).
+    if path == "/api/groups" and method in ("POST", "DELETE"):
+        return True
+    if path.startswith("/api/groups/") and method == "DELETE":
+        return True
+    # Access-control mutations.
+    if path == "/api/access" and method in ("POST", "DELETE"):
+        return True
+    # Branch registration (write to a repo's branch set).
+    if (
+        path.startswith("/api/repos/")
+        and path.endswith("/branches")
+        and method == "POST"
+    ):
+        return True
+    # Platform secret updates.
+    if path == "/api/admin/ai-key" and method == "POST":
+        return True
+    return False
+
+
 def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-return-statements,too-many-branches
     """Handle REST API requests.
 
@@ -410,7 +510,29 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
 
     path = request.path
     method = request.method
-    headers = {"Content-Type": "application/json", **cors_headers()}
+    headers = {"Content-Type": "application/json", **cors_headers(request)}
+
+    # Fail-closed authentication gate for the entire API surface. Every
+    # /api/* route requires a verified caller; unauthenticated requests are
+    # rejected with 401 before any handler runs. This closes the gap where
+    # group/branch/access mutations were reachable without a verified caller.
+    # Routes that need elevated privilege are additionally admin-gated below.
+    session_user = _get_session_user(request)
+    if session_user.get("username", "unknown") == "unknown":
+        return Response(
+            status_code=401,
+            body=json.dumps({"error": "Authentication required"}),
+            headers=headers,
+        )
+
+    # Administrative routes (group management, access control, branch
+    # registration, and secret updates) additionally require an admin
+    # session. Token, PR, and read-listing routes are available to any
+    # authenticated user and enforce their own per-user ownership checks.
+    if _is_admin_api_route(path, method):
+        denied = _require_admin(request, headers)
+        if denied is not None:
+            return denied
 
     # POST /api/groups — create group
     if path == "/api/groups" and method == "POST":
@@ -942,7 +1064,7 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
         scope_str = body.get("scope", "read/write")
         expiry_days = int(body.get("expiry_days", 365))
         username = _get_request_username(request)
-        if not username:
+        if not username:  # pragma: no cover - defense-in-depth; the API gate already rejects unauthenticated callers with 401
             return Response(
                 status_code=401,
                 body=json.dumps({"error": "Authentication required"}),
@@ -970,7 +1092,7 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
     if path == "/api/tokens" and method == "GET":
         from gitgateway.tokens import list_tokens  # pylint: disable=import-outside-toplevel
         username = _get_request_username(request)
-        if not username:
+        if not username:  # pragma: no cover - defense-in-depth; the API gate already rejects unauthenticated callers with 401
             return Response(
                 status_code=401,
                 body=json.dumps({"error": "Authentication required"}),
@@ -990,7 +1112,7 @@ def _handle_api(request: Request) -> Response:  # pylint: disable=too-many-retur
             revoke_token, TokenNotFoundError,
         )
         username = _get_request_username(request)
-        if not username:
+        if not username:  # pragma: no cover - defense-in-depth; the API gate already rejects unauthenticated callers with 401
             return Response(
                 status_code=401,
                 body=json.dumps({"error": "Authentication required"}),
@@ -2260,6 +2382,28 @@ def _handle_lfs(request: Request) -> Response:
     except (json.JSONDecodeError, UnicodeDecodeError):
         body = {}
 
+    # Per-repo RBAC gate (fail-closed). A batch download needs READONLY;
+    # every other LFS operation (upload, lock create/verify/unlock) mutates
+    # state and needs CONTRIBUTOR. Determine the level up front and enforce
+    # it before dispatching, mirroring the git data-plane gate.
+    from gitgateway.models import AccessLevel  # pylint: disable=import-outside-toplevel
+    is_lfs_read_only = (
+        lfs_path == "objects/batch"
+        and request.method == "POST"
+        and body.get("operation", "download") == "download"
+    ) or (lfs_path == "locks" and request.method == "GET")
+    lfs_required_level = (
+        AccessLevel.READONLY if is_lfs_read_only else AccessLevel.CONTRIBUTOR
+    )
+    if not _authorize_repo_access(
+        username, group, repo_name, lfs_required_level,
+    ):
+        return Response(
+            status_code=403,
+            body=json.dumps({"message": "Access denied for this repository"}),
+            headers=lfs_headers,
+        )
+
     # POST /objects/batch — presigned URLs for upload/download
     if lfs_path == "objects/batch" and request.method == "POST":
         operation = body.get("operation", "download")
@@ -2405,13 +2549,20 @@ def _authenticate_git_request(request: Request) -> dict | None:
     if username != "__token__":
         return None
 
-    # Try JWT validation first
+    # Try JWT validation first. The JWT proves *identity* only; the actual
+    # per-repo entitlement is resolved later by _authorize_repo_access via
+    # check_permission, so the scope here must reflect what the credential
+    # itself grants — not an assumption. A federated JWT can carry write
+    # ability, but authorization still gates the specific repo.
     idp_url = _os.environ.get("IDP_URL", "")
     if idp_url:
         try:
             from gitgateway.auth import validate_jwt  # pylint: disable=import-outside-toplevel
             user = validate_jwt(password, idp_url)
-            return {"username": user.username, "scope": "read/write"}
+            # has_access=False downgrades the credential to read-only; RBAC
+            # still has the final say on whether any access is granted.
+            scope = "read/write" if user.has_access else "read"
+            return {"username": user.username, "scope": scope}
         except Exception:  # pylint: disable=broad-except  # nosec B110
             pass  # Not a valid JWT, try API key
 
@@ -2424,6 +2575,45 @@ def _authenticate_git_request(request: Request) -> dict | None:
         return {"username": pat.username, "scope": pat.scope.value}
     except TokenError:
         return None
+
+
+def _authorize_repo_access(
+    username: str,
+    group: str,
+    repo_name: str,
+    required_level: AccessLevel,
+) -> bool:
+    """Check whether a user may access a repository at the given level.
+
+    Fail-closed per-repo/per-group RBAC gate for the git and LFS data
+    planes. Delegates to :func:`gitgateway.db.check_permission`, which
+    resolves group- and repo-level access with most-permissive-wins. Any
+    unexpected error resolves to denial.
+
+    Args:
+        username: The authenticated username.
+        group: The repository group.
+        repo_name: The repository name.
+        required_level: Minimum AccessLevel required for the operation.
+
+    Returns:
+        True if access is granted, False otherwise.
+    """
+    from gitgateway.db import check_permission  # pylint: disable=import-outside-toplevel
+
+    if not username:
+        return False
+    try:
+        return check_permission(
+            username, group, repo_name, required_level=required_level,
+        )
+    except Exception:  # pylint: disable=broad-except
+        # Fail closed: an error resolving permissions must not grant access.
+        LOG.warning(
+            "Authorization check failed for %s on %s/%s; denying",
+            username, group, repo_name, exc_info=True,
+        )
+        return False
 
 
 def _is_whitespace_only_diff(entry: dict) -> bool:
@@ -5042,63 +5232,137 @@ def _render_admin_access_page() -> str:
     </script>"""
 
 
-def _handle_auth_callback(request: Request, idp_url: str) -> Response:
-    """Handle the OAuth callback from the IdP.
+def _auth_fragment_bootstrap() -> Response:
+    """Return an HTML page that recovers a token from the URL fragment.
 
-    Extracts the JWT token from the query string, sets a session
-    cookie, and redirects to the dashboard.
+    The IdP delivers the JWT in the URL fragment (``#token=...``). Fragments
+    are never sent to the server, so when no token is present in the query
+    string we return a minimal page whose script reads ``location.hash`` and
+    reloads ``/auth/callback?token=...`` so the server can process it. If the
+    fragment carries no token either, the page shows a clear error.
+
+    Returns:
+        A 200 HTML Response containing the bootstrap script.
+    """
+    # The script POSTs the recovered token (rather than redirecting with it in
+    # the query string) so the JWT never lands in an access log or Referer —
+    # matching the IdP's reason for moving it into the fragment.
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>Signing in…</title></head><body>"
+        "<p id='msg'>Completing sign-in…</p>"
+        "<form id='f' method='post' action='/auth/callback'>"
+        "<input type='hidden' name='token' id='tok'></form>"
+        "<script>(function(){"
+        "var h=window.location.hash||'';"
+        "if(h.charAt(0)==='#'){h=h.substring(1);}"
+        "var p=new URLSearchParams(h);"
+        "var t=p.get('token');"
+        "if(t){"
+        "document.getElementById('tok').value=t;"
+        "document.getElementById('f').submit();"
+        "}else{"
+        "document.getElementById('msg').textContent="
+        "'Missing token parameter';"
+        "}"
+        "})();</script></body></html>"
+    )
+    return Response(
+        status_code=200,
+        body=html,
+        headers={"Content-Type": "text/html"},
+    )
+
+
+def _extract_callback_token(request: Request) -> str:
+    """Extract the IdP token from an auth-callback request.
+
+    Prefers a POSTed form body (used by the fragment bootstrap, keeping the
+    token out of the query string), then falls back to a ``token=`` query
+    parameter for direct links.
 
     Args:
         request: The normalized request.
-        idp_url: The IdP URL (unused here but available for validation).
 
     Returns:
-        302 redirect to dashboard with session cookie set.
+        The raw token string, or "" if none is present.
+    """
+    if request.method == "POST" and request.body:
+        from urllib.parse import parse_qs  # pylint: disable=import-outside-toplevel
+        try:
+            decoded = request.body.decode("utf-8", errors="replace")
+        except (UnicodeDecodeError, AttributeError):  # pragma: no cover - defensive
+            decoded = ""
+        values = parse_qs(decoded).get("token", [])
+        if values and values[0]:
+            return values[0]
+
+    for param in request.query_string.split("&"):
+        if param.startswith("token="):
+            return param[6:]
+    return ""
+
+
+def _handle_auth_callback(request: Request, idp_url: str) -> Response:
+    """Handle the OAuth callback from the IdP.
+
+    The IdP returns the JWT in the URL fragment. Because fragments never reach
+    the server, the first hit (no query token) returns a tiny bootstrap page
+    that re-submits the fragment token as a query parameter; the second hit
+    carries ``?token=...`` which is validated here. A valid token sets a
+    session cookie and redirects to the dashboard; an invalid token is
+    rejected (no session is issued).
+
+    Args:
+        request: The normalized request.
+        idp_url: The IdP URL used to validate the token.
+
+    Returns:
+        A bootstrap page, a 302 redirect with a session cookie, or a 401.
     """
     import os  # pylint: disable=import-outside-toplevel
     from gitgateway.auth import (  # pylint: disable=import-outside-toplevel
+        AuthError,
         create_session_cookie,
-        AuthenticatedUser,
         validate_jwt,
     )
 
-    # Extract token from query string
-    token = ""  # nosec B105 — not a password, initializing variable
-    for param in request.query_string.split("&"):
-        if param.startswith("token="):
-            token = param[6:]
-            break
+    token = _extract_callback_token(request)  # nosec B105 — not a password
 
     if not token:
-        return Response(
-            status_code=400,
-            body="<html><body>Missing token parameter</body></html>",
-            headers={"Content-Type": "text/html"},
-        )
+        # A GET with no token means the token is (or isn't) in the URL
+        # fragment, which only the browser can see — serve the bootstrap to
+        # recover it. A POST with no token means the fragment truly had none.
+        if request.method == "POST":
+            return Response(
+                status_code=400,
+                body=(
+                    "<html><body>Missing token parameter</body></html>"
+                ),
+                headers={"Content-Type": "text/html"},
+            )
+        return _auth_fragment_bootstrap()
 
-    # Validate JWT and create session
+    # Validate the JWT strictly. A token that fails verification (bad
+    # signature, wrong issuer/audience, expired) is rejected — we never issue
+    # a session from an unverified token.
     try:
         user = validate_jwt(token, idp_url)
-    except Exception:  # pylint: disable=broad-except
-        # If validation fails, still set session with basic info from token
-        # (In production, you'd reject invalid tokens)
-        import jwt as pyjwt  # pylint: disable=import-outside-toplevel
-        try:
-            payload = pyjwt.decode(
-                token, options={"verify_signature": False},
-            )
-            user = AuthenticatedUser(
-                username=payload.get("sub", "unknown"),
-                is_admin="gitgateway-admin" in payload.get("claims", []),
-                token=token,
-            )
-        except Exception:  # pylint: disable=broad-except
-            user = AuthenticatedUser(username="unknown", token=token)
+    except AuthError as exc:
+        LOG.warning("Rejected auth callback token: %s", exc)
+        return Response(
+            status_code=401,
+            body=(
+                "<html><body><h1>Sign-in failed</h1>"
+                "<p>Your sign-in token was not accepted. "
+                "Please try signing in again.</p></body></html>"
+            ),
+            headers={"Content-Type": "text/html"},
+        )
 
     # Create session cookie
     secret_key = os.environ.get("SESSION_SECRET", "gitgateway-session-secret")
     cookie_value = create_session_cookie(user, secret_key, max_age=3600)
-    domain_name = os.environ.get("DOMAIN_NAME", "")
 
     # Track known user
     _record_known_user(user.username)
