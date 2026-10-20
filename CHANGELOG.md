@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Structured `SYNC_METRIC` logging for S3<->/tmp repo syncs in `storage.py`
+  (operation, object/byte counts, duration, throughput, and a warm-cache flag
+  for downloads). Emitted as a single JSON log line per sync so the first-
+  request git latency can be measured in CloudWatch Logs Insights (and turned
+  into a metric filter) before deciding whether to optimize the sync path.
 - End-to-end auth-callback tests (`tests/e2e/test_auth_callback.py`) that POST
   a real IdP JWT to the deployed `/auth/callback` and assert a 302 + hardened
   session cookie (and a clean 401 for invalid tokens, never a 500). These

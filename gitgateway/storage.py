@@ -7,8 +7,10 @@ delta sync with optimistic locking.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import boto3
@@ -17,6 +19,51 @@ LOG = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "gitgateway-repos"
 S3_KEY_PREFIX = "repos"
+
+
+def _log_sync_metric(
+    operation: str,
+    group: str,
+    repo: str,
+    *,
+    object_count: int,
+    byte_count: int,
+    duration_s: float,
+    warm_cache: bool | None = None,
+) -> None:
+    """Emit a single structured log line describing a repo sync.
+
+    The line is JSON prefixed with ``SYNC_METRIC`` so it can be queried in
+    CloudWatch Logs Insights or turned into a metric filter without any
+    extra instrumentation. This is measurement-only: it informs whether the
+    S3<->/tmp sync latency is worth optimizing and, if so, which sync
+    (download vs upload) and repo sizes dominate.
+
+    Args:
+        operation: ``"s3_to_local"`` or ``"local_to_s3"``.
+        group: Repository group.
+        repo: Repository name.
+        object_count: Number of objects transferred.
+        byte_count: Total bytes transferred.
+        duration_s: Wall-clock duration in seconds.
+        warm_cache: For downloads, whether the repo already existed in
+            /tmp (warm Lambda instance). None when not applicable.
+    """
+    payload = {
+        "metric": "repo_sync",
+        "operation": operation,
+        "repo": f"{group}/{repo}",
+        "objects": object_count,
+        "bytes": byte_count,
+        "duration_ms": round(duration_s * 1000, 1),
+    }
+    if byte_count and duration_s > 0:
+        payload["throughput_mbps"] = round(
+            (byte_count / 1_000_000) / duration_s, 2,
+        )
+    if warm_cache is not None:
+        payload["warm_cache"] = warm_cache
+    LOG.info("SYNC_METRIC %s", json.dumps(payload, separators=(",", ":")))
 
 
 class StorageError(Exception):
@@ -102,7 +149,7 @@ def init_bare_repo(
     return local_path
 
 
-def sync_repo_to_local(
+def sync_repo_to_local(  # pylint: disable=too-many-locals
     group: str,
     repo: str,
     bucket: str = DEFAULT_BUCKET,
@@ -138,12 +185,19 @@ def sync_repo_to_local(
             f"Repository '{group}/{repo}' not found in S3",
         )
 
+    # Whether the repo was already present in /tmp indicates a warm Lambda
+    # instance (the full re-download below happens regardless today; this
+    # signal lets us quantify how often the cost is paid on warm vs cold).
+    warm_cache = local_path.exists()
+
     # Ensure local directory exists
-    if local_path.exists():
+    if warm_cache:
         _remove_tree(local_path)
     local_path.mkdir(parents=True, exist_ok=True)
 
-    # Download each object
+    # Download each object, timing the transfer and tallying bytes moved.
+    start = time.perf_counter()
+    byte_count = 0
     for obj_key in objects:
         relative = obj_key[len(prefix):]
         if not relative:
@@ -151,7 +205,17 @@ def sync_repo_to_local(
         local_file = local_path / relative
         local_file.parent.mkdir(parents=True, exist_ok=True)
         client.download_file(bucket, obj_key, str(local_file))
+        try:
+            byte_count += local_file.stat().st_size
+        except OSError:  # pragma: no cover - defensive: file just written
+            pass
+    duration_s = time.perf_counter() - start
 
+    _log_sync_metric(
+        "s3_to_local", group, repo,
+        object_count=len(objects), byte_count=byte_count,
+        duration_s=duration_s, warm_cache=warm_cache,
+    )
     LOG.info("Synced repo from S3: %s/%s", group, repo)
     return local_path
 
@@ -183,7 +247,16 @@ def sync_repo_to_s3(
         )
 
     client = _get_s3_client(s3_client)
-    _sync_local_to_s3(local_path, group, repo, bucket, client)
+    start = time.perf_counter()
+    object_count, byte_count = _sync_local_to_s3(
+        local_path, group, repo, bucket, client,
+    )
+    duration_s = time.perf_counter() - start
+    _log_sync_metric(
+        "local_to_s3", group, repo,
+        object_count=object_count, byte_count=byte_count,
+        duration_s=duration_s,
+    )
     LOG.info("Synced repo to S3: %s/%s", group, repo)
 
 
@@ -301,7 +374,7 @@ def _sync_local_to_s3(  # pylint: disable=too-many-locals
     repo: str,
     bucket: str,
     client: object,
-) -> None:
+) -> tuple[int, int]:
     """Upload all files from local path to S3.
 
     Args:
@@ -310,11 +383,15 @@ def _sync_local_to_s3(  # pylint: disable=too-many-locals
         repo: The repository name.
         bucket: S3 bucket name.
         client: boto3 S3 client.
+
+    Returns:
+        Tuple of (object_count, byte_count) uploaded.
     """
     prefix = _repo_s3_prefix(group, repo)
 
     # Upload all local files and track which keys should exist
     local_keys = set()
+    byte_count = 0
     for root, _dirs, files in os.walk(local_path):
         for filename in files:
             file_path = Path(root) / filename
@@ -322,6 +399,10 @@ def _sync_local_to_s3(  # pylint: disable=too-many-locals
             s3_key = f"{prefix}{relative}"
             client.upload_file(str(file_path), bucket, s3_key)
             local_keys.add(s3_key)
+            try:
+                byte_count += file_path.stat().st_size
+            except OSError:  # pragma: no cover - defensive: file just walked
+                pass
 
     # Delete S3 objects that no longer exist locally (e.g. deleted
     # branch refs). This makes S3 mirror the local repo state so
@@ -336,6 +417,8 @@ def _sync_local_to_s3(  # pylint: disable=too-many-locals
                 Bucket=bucket,
                 Delete={"Objects": [{"Key": k} for k in batch]},
             )
+
+    return len(local_keys), byte_count
 
 
 def _list_s3_objects(

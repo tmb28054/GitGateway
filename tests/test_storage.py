@@ -13,6 +13,7 @@ from gitgateway.storage import (
     ConflictError,
     StorageError,
     _list_s3_objects,
+    _log_sync_metric,
     _remove_tree,
     _repo_s3_prefix,
     _sync_local_to_s3,
@@ -27,6 +28,49 @@ from gitgateway.storage import (
 
 
 BUCKET = "test-bucket"
+
+
+class TestLogSyncMetric:
+    """Tests for the _log_sync_metric structured-logging helper."""
+
+    def test_includes_throughput_and_warm_flag(self, caplog) -> None:
+        """A sync with bytes+duration logs throughput and warm_cache."""
+        import json
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="gitgateway.storage"):
+            _log_sync_metric(
+                "s3_to_local", "team", "app",
+                object_count=10, byte_count=2_000_000,
+                duration_s=0.5, warm_cache=True,
+            )
+        line = next(
+            m for m in caplog.messages if m.startswith("SYNC_METRIC ")
+        )
+        payload = json.loads(line[len("SYNC_METRIC "):])
+        assert payload["operation"] == "s3_to_local"
+        assert payload["repo"] == "team/app"
+        assert payload["objects"] == 10
+        assert payload["bytes"] == 2_000_000
+        assert payload["throughput_mbps"] == 4.0  # 2MB / 0.5s
+        assert payload["warm_cache"] is True
+
+    def test_omits_throughput_when_no_bytes(self, caplog) -> None:
+        """A zero-byte sync omits throughput and warm_cache when unset."""
+        import json
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="gitgateway.storage"):
+            _log_sync_metric(
+                "local_to_s3", "team", "app",
+                object_count=0, byte_count=0, duration_s=0.0,
+            )
+        line = next(
+            m for m in caplog.messages if m.startswith("SYNC_METRIC ")
+        )
+        payload = json.loads(line[len("SYNC_METRIC "):])
+        assert "throughput_mbps" not in payload
+        assert "warm_cache" not in payload
 
 
 @pytest.fixture
