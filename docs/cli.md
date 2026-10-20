@@ -49,18 +49,29 @@ Deploy the GitGateway infrastructure via CloudFormation.
 
 ```bash
 gitgateway deploy \
+    --stack-name gitgateway \
     --domain-name git.example.com \
     --acm-certificate-arn arn:aws:acm:us-east-1:123456789012:certificate/abc-123 \
     --region us-east-1 \
-    --profile production
+    --profile production \
+    --idp-url https://idp.example.com \
+    --jwt-audience git
 ```
+
+On success the command prints the resulting CloudFormation stack outputs as
+JSON. It exits non-zero if the deployment fails.
 
 | Flag | Required | Description |
 |------|----------|-------------|
+| `--stack-name` | No | CloudFormation stack name (default: gitgateway) |
 | `--domain-name` | Yes | Custom domain for the service |
 | `--acm-certificate-arn` | Yes | ACM certificate ARN for HTTPS |
 | `--region` | No | AWS region (default: us-east-1) |
 | `--profile` | No | AWS named profile |
+| `--idp-url` | No | Identity provider URL for OAuth |
+| `--jwt-audience` | No | Expected JWT `aud` claim from the IdP (default: git) |
+| `--enable-ai` | No | Enable AI features (requires a Gemini API key) |
+| `--disable-codebuild` | No | Disable CodeBuild integration (enabled by default) |
 
 ### repo create
 

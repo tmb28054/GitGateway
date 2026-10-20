@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--jwt-audience` deploy flag, so the expected JWT audience is pinned at
   deploy time rather than left unset. Also wired `ALLOWED_ORIGINS` to the
   deployment's custom domain so the CORS allowlist is populated by default.
+- The `gitgateway deploy` CLI command now performs a real deployment: it calls
+  `deploy_stack()` and prints the resulting CloudFormation stack outputs (it
+  was previously a stub that only echoed its arguments). New flags:
+  `--stack-name`, `--idp-url`, `--enable-ai`, and `--disable-codebuild`.
 
 ### Security
 - The OAuth callback no longer falls back to an unverified token decode when

@@ -141,6 +141,10 @@ def _build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-loca
         "deploy", help="Deploy GitGateway infrastructure",
     )
     deploy_parser.add_argument(
+        "--stack-name", default="gitgateway",
+        help="CloudFormation stack name (default: gitgateway)",
+    )
+    deploy_parser.add_argument(
         "--domain-name", required=True, help="Custom domain",
     )
     deploy_parser.add_argument(
@@ -149,8 +153,19 @@ def _build_parser() -> argparse.ArgumentParser:  # pylint: disable=too-many-loca
     deploy_parser.add_argument("--region", default="us-east-1")
     deploy_parser.add_argument("--profile", help="AWS profile")
     deploy_parser.add_argument(
+        "--idp-url", default="", help="Identity provider URL for OAuth",
+    )
+    deploy_parser.add_argument(
         "--jwt-audience", default="git",
         help="Expected JWT 'aud' claim from the IdP (default: git)",
+    )
+    deploy_parser.add_argument(
+        "--enable-ai", action="store_true",
+        help="Enable AI features (requires a Gemini API key)",
+    )
+    deploy_parser.add_argument(
+        "--disable-codebuild", action="store_true",
+        help="Disable CodeBuild integration (enabled by default)",
     )
     deploy_parser.set_defaults(func=_handle_deploy)
 
@@ -368,14 +383,36 @@ def _handle_pr_merge(args: argparse.Namespace) -> int:
 
 
 def _handle_deploy(args: argparse.Namespace) -> int:
-    """Handle deploy command."""
+    """Handle deploy command.
+
+    Packages and deploys the GitGateway CloudFormation stack, then prints
+    the stack outputs. Returns a non-zero exit code if deployment fails.
+    """
+    from gitgateway.deploy import (  # pylint: disable=import-outside-toplevel
+        DeployError,
+        deploy_stack,
+    )
+
+    try:
+        outputs = deploy_stack(
+            stack_name=args.stack_name,
+            domain_name=args.domain_name,
+            acm_certificate_arn=args.acm_certificate_arn,
+            region=args.region,
+            profile=args.profile,
+            enable_codebuild=not args.disable_codebuild,
+            enable_ai=args.enable_ai,
+            idp_url=args.idp_url,
+            jwt_audience=args.jwt_audience,
+        )
+    except DeployError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        return 1
+
     _output({
         "action": "deploy",
-        "domain_name": args.domain_name,
-        "acm_certificate_arn": args.acm_certificate_arn,
-        "region": args.region,
-        "profile": args.profile,
-        "jwt_audience": args.jwt_audience,
+        "stack_name": args.stack_name,
+        "outputs": outputs,
     })
     return 0
 

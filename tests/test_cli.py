@@ -238,35 +238,74 @@ class TestDeployCommand:
     """Tests for deploy subcommand."""
 
     def test_deploy(self, capsys) -> None:
-        """Deploys infrastructure."""
-        result = main([
-            "deploy",
-            "--domain-name", "git.example.com",
-            "--acm-certificate-arn", "arn:aws:acm:us-east-1:123:cert/abc",
-            "--region", "eu-west-1",
-            "--profile", "prod",
-        ])
+        """Deploys infrastructure and prints stack outputs."""
+        with patch(
+            "gitgateway.deploy.deploy_stack",
+            return_value={"ApiUrl": "https://api.example"},
+        ) as ds:
+            result = main([
+                "deploy",
+                "--stack-name", "mygw",
+                "--domain-name", "git.example.com",
+                "--acm-certificate-arn", "arn:aws:acm:us-east-1:123:cert/abc",
+                "--region", "eu-west-1",
+                "--profile", "prod",
+                "--idp-url", "https://idp.example.com",
+            ])
         assert result == 0
+        ds.assert_called_once()
+        kwargs = ds.call_args.kwargs
+        assert kwargs["stack_name"] == "mygw"
+        assert kwargs["domain_name"] == "git.example.com"
+        assert kwargs["acm_certificate_arn"] == "arn:aws:acm:us-east-1:123:cert/abc"
+        assert kwargs["region"] == "eu-west-1"
+        assert kwargs["profile"] == "prod"
+        assert kwargs["idp_url"] == "https://idp.example.com"
+        # Defaults when flags are not provided.
+        assert kwargs["jwt_audience"] == "git"
+        assert kwargs["enable_codebuild"] is True
+        assert kwargs["enable_ai"] is False
         output = json.loads(capsys.readouterr().out)
         assert output["action"] == "deploy"
-        assert output["domain_name"] == "git.example.com"
-        assert output["acm_certificate_arn"] == "arn:aws:acm:us-east-1:123:cert/abc"
-        assert output["region"] == "eu-west-1"
-        assert output["profile"] == "prod"
-        # Defaults to the IdP's audience when not overridden.
-        assert output["jwt_audience"] == "git"
+        assert output["stack_name"] == "mygw"
+        assert output["outputs"] == {"ApiUrl": "https://api.example"}
 
-    def test_deploy_custom_jwt_audience(self, capsys) -> None:
-        """The --jwt-audience flag overrides the default."""
-        result = main([
-            "deploy",
-            "--domain-name", "git.example.com",
-            "--acm-certificate-arn", "arn:aws:acm:us-east-1:123:cert/abc",
-            "--jwt-audience", "gitgateway",
-        ])
+    def test_deploy_custom_jwt_audience_and_flags(self) -> None:
+        """--jwt-audience, --enable-ai and --disable-codebuild are honored."""
+        with patch(
+            "gitgateway.deploy.deploy_stack", return_value={},
+        ) as ds:
+            result = main([
+                "deploy",
+                "--domain-name", "git.example.com",
+                "--acm-certificate-arn", "arn:aws:acm:us-east-1:123:cert/abc",
+                "--jwt-audience", "gitgateway",
+                "--enable-ai",
+                "--disable-codebuild",
+            ])
         assert result == 0
-        output = json.loads(capsys.readouterr().out)
-        assert output["jwt_audience"] == "gitgateway"
+        kwargs = ds.call_args.kwargs
+        assert kwargs["jwt_audience"] == "gitgateway"
+        assert kwargs["enable_ai"] is True
+        assert kwargs["enable_codebuild"] is False
+        # Default stack name is applied.
+        assert kwargs["stack_name"] == "gitgateway"
+
+    def test_deploy_failure_returns_1(self, capsys) -> None:
+        """A DeployError is reported and yields a non-zero exit code."""
+        from gitgateway.deploy import DeployError
+
+        with patch(
+            "gitgateway.deploy.deploy_stack",
+            side_effect=DeployError("boom"),
+        ):
+            result = main([
+                "deploy",
+                "--domain-name", "git.example.com",
+                "--acm-certificate-arn", "arn:aws:acm:us-east-1:123:cert/abc",
+            ])
+        assert result == 1
+        assert "boom" in capsys.readouterr().err
 
 
 class TestApiUrl:
