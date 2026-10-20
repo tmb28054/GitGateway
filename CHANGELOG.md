@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- End-to-end auth-callback tests (`tests/e2e/test_auth_callback.py`) that POST
+  a real IdP JWT to the deployed `/auth/callback` and assert a 302 + hardened
+  session cookie (and a clean 401 for invalid tokens, never a 500). These
+  exercise the deployed Lambda + real IdP metadata — the path that two recent
+  incidents (the `defusedxml` layer gap and the issuer/origin mismatch) slipped
+  through because unit tests ran against a local venv with mocked metadata.
+
 ### Fixed
 - Added `defusedxml` to the core Lambda layer dependencies (`CORE_LAYER_DEPS`).
   The R-21 SAML-metadata parsing switched to `defusedxml`, but it was only
