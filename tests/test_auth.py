@@ -30,6 +30,7 @@ from gitgateway.auth import (
     validate_jwt,
     validate_session_cookie,
     get_idp_public_key,
+    idp_origin,
     _extract_public_key_from_metadata,
 )
 
@@ -469,6 +470,65 @@ class TestValidateJwt:
         user = validate_jwt(token, "https://idp.botthouse.net", fetch)
         assert user.is_admin is False
         assert user.has_access is False
+
+    def test_issuer_uses_origin_when_idp_url_has_path(
+        self, metadata_xml, rsa_keypair,
+    ) -> None:
+        """With a path in idp_url, issuer is validated against the origin.
+
+        The IdP serves metadata at the host root and mints
+        iss="<origin>/metadata" even when the service path is "/git", so a
+        token issued by the root must validate when idp_url includes "/git".
+        """
+        private_key_pem, _, _ = rsa_keypair
+
+        def fetch(url):
+            # Metadata must be fetched from the origin, not the /git path.
+            assert url == "https://idp.botthouse.net/metadata"
+            return metadata_xml
+
+        payload = {
+            "sub": "topaz",
+            "iss": "https://idp.botthouse.net/metadata",
+            "aud": "git",
+            "exp": int(time.time()) + 3600,
+            "claims": ["gitgateway-admin", "gitgateway-access"],
+        }
+        token = pyjwt.encode(payload, private_key_pem, algorithm="RS256")
+        user = validate_jwt(
+            token, "https://idp.botthouse.net/git", fetch, audience="git",
+        )
+        assert user.username == "topaz"
+        assert user.is_admin is True
+
+
+class TestIdpOrigin:
+    """Tests for the idp_origin helper."""
+
+    def test_strips_path_segment(self) -> None:
+        """A path segment such as /git is dropped to the origin."""
+        assert (
+            idp_origin("https://idp.botthouse.net/git")
+            == "https://idp.botthouse.net"
+        )
+
+    def test_no_path_unchanged(self) -> None:
+        """A URL without a path returns the same origin."""
+        assert (
+            idp_origin("https://idp.botthouse.net")
+            == "https://idp.botthouse.net"
+        )
+
+    def test_trailing_slash_and_port(self) -> None:
+        """Port is preserved; trailing path is dropped."""
+        assert (
+            idp_origin("https://idp.example.com:8443/git/")
+            == "https://idp.example.com:8443"
+        )
+
+    def test_non_url_falls_back(self) -> None:
+        """A value with no scheme/host falls back to the stripped input."""
+        assert idp_origin("not-a-url/") == "not-a-url"
 
 
 class TestParseBasicAuth:

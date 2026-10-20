@@ -14,12 +14,35 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import jwt
 import requests
 
 LOG = logging.getLogger(__name__)
+
+
+def idp_origin(idp_url: str) -> str:
+    """Return the scheme+host origin of an IdP URL, dropping any path.
+
+    The IdP serves its SAML metadata (and mints the token ``iss``) at the
+    host root — e.g. ``https://idp.botthouse.net/metadata`` — even when the
+    per-service login path includes a segment such as ``/git``. Metadata
+    fetching and issuer verification must therefore use the origin, not the
+    full configured URL.
+
+    Args:
+        idp_url: The configured IdP URL (may include a path, e.g. ``/git``).
+
+    Returns:
+        The ``scheme://host[:port]`` origin, with no trailing path or slash.
+        Falls back to the input (right-stripped of ``/``) when it has no
+        recognizable scheme/host.
+    """
+    parsed = urlparse(idp_url)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return idp_url.rstrip("/")
 
 # Cache for IdP public key
 _PUBLIC_KEY_CACHE: dict[str, Any] = {}
@@ -63,7 +86,10 @@ def get_idp_public_key(
     Raises:
         AuthError: If the public key cannot be retrieved.
     """
-    cache_key = idp_url
+    # Metadata is served at the IdP host root, independent of any per-service
+    # path segment in idp_url (e.g. "/git").
+    origin = idp_origin(idp_url)
+    cache_key = origin
     now = time.time()
 
     # Check cache
@@ -73,7 +99,7 @@ def get_idp_public_key(
             return cached_key
 
     # Fetch metadata
-    metadata_url = f"{idp_url}/metadata"
+    metadata_url = f"{origin}/metadata"
     try:
         if fetch_func:
             content = fetch_func(metadata_url)
@@ -222,7 +248,9 @@ def validate_jwt(
 
     decode_kwargs: dict[str, Any] = {
         "algorithms": algorithms,
-        "issuer": f"{idp_url}/metadata",
+        # The IdP sets iss to "<origin>/metadata" (host root), regardless of
+        # any per-service path in idp_url.
+        "issuer": f"{idp_origin(idp_url)}/metadata",
     }
     if audience:
         decode_kwargs["audience"] = audience
