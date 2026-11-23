@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through because unit tests ran against a local venv with mocked metadata.
 
 ### Fixed
+- `git push` returned HTTP 403 for any pack over 8 KB: the WAF managed rule
+  `SizeRestrictions_BODY` blocked `git-receive-pack` POSTs. The rule is now
+  counted in the web ACL and the same 8 KB limit is enforced by a new
+  `BodySizeNonGit` rule on every path except `git-receive-pack` and
+  `git-upload-pack`.
 - Added `defusedxml` to the core Lambda layer dependencies (`CORE_LAYER_DEPS`).
   The R-21 SAML-metadata parsing switched to `defusedxml`, but it was only
   added to `pyproject.toml`, not the layer bundle, so the deployed Lambda

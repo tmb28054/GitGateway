@@ -689,10 +689,58 @@ Resources:
             ManagedRuleGroupStatement:
               VendorName: AWS
               Name: AWSManagedRulesCommonRuleSet
+              # SizeRestrictions_BODY blocks any body over 8 KB, which blocks
+              # every git push (git-receive-pack POST carries the pack). Count
+              # it here and re-apply the same limit to non-git paths in the
+              # BodySizeNonGit rule below.
+              RuleActionOverrides:
+                - Name: SizeRestrictions_BODY
+                  ActionToUse:
+                    Count: {}
           VisibilityConfig:
             SampledRequestsEnabled: true
             CloudWatchMetricsEnabled: true
             MetricName: !Sub '${StackNamePrefix}-common-rules'
+        - Name: BodySizeNonGit
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            AndStatement:
+              Statements:
+                - SizeConstraintStatement:
+                    FieldToMatch:
+                      Body:
+                        OversizeHandling: MATCH
+                    ComparisonOperator: GT
+                    Size: 8192
+                    TextTransformations:
+                      - Priority: 0
+                        Type: NONE
+                - NotStatement:
+                    Statement:
+                      OrStatement:
+                        Statements:
+                          - ByteMatchStatement:
+                              FieldToMatch:
+                                UriPath: {}
+                              PositionalConstraint: ENDS_WITH
+                              SearchString: /git-receive-pack
+                              TextTransformations:
+                                - Priority: 0
+                                  Type: NONE
+                          - ByteMatchStatement:
+                              FieldToMatch:
+                                UriPath: {}
+                              PositionalConstraint: ENDS_WITH
+                              SearchString: /git-upload-pack
+                              TextTransformations:
+                                - Priority: 0
+                                  Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${StackNamePrefix}-body-size-non-git'
         - Name: AWSKnownBadInputs
           Priority: 1
           OverrideAction:
