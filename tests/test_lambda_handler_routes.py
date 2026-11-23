@@ -2097,6 +2097,19 @@ class TestRenderHelpers:
         assert "No repositories" in html
 
 
+    def test_sidebar_list_groups_failure(self, aws) -> None:
+        """A failure listing groups degrades to an empty sidebar."""
+        from gitgateway.lambda_handler import _render_sidebar
+        _handle_api(_req("POST", "/api/groups", {"name": "team"}))
+        _handle_api(_req("POST", "/api/access", {
+            "username": "alice", "resource": "team", "level": "admin",
+        }))
+        with patch(
+            "gitgateway.db.list_groups",
+            side_effect=RuntimeError("ddb down"),
+        ):
+            html = _render_sidebar("alice")
+        assert "No accessible groups" in html
 class TestRenderPermissionLegs:
     """Cover 403/404 and empty-state legs of the render functions."""
 
