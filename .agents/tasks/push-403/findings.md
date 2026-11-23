@@ -37,3 +37,11 @@ so no data or token change is needed.
 - WAF logs record the `authorization` header (Basic token). Recommend adding `RedactedFields` for that header on the logging
   configuration; not changed here. The token pasted in the report should be treated as exposed in these logs: rotate it.
 - A live push could not be demonstrated without deploying.
+
+## Applied (user approved)
+- Released 0.2.6 (commit 1a23bb8), tests 1314 passed at 100%.
+- Change set `waf-body-size-fix` on stack gitgateway (KMS false, other params UsePreviousValue): Modify WebAcl (Replacement False) plus
+  CloudFrontDistribution and WafLoggingConfiguration, both flagged only because they reference WebAcl.Arn (ARN unchanged). Executed; UPDATE_COMPLETE.
+- Push from linting-api: `88e1eb2..d0d494a main -> main` succeeded. WAF log: POST git-receive-pack ALLOW, SizeRestrictions_BODY: COUNT.
+- Pushed 1cb6113..1a23bb8 to origin and github (no force).
+- Follow-ups not done (not approved): rotate token gg_b073... ; add RedactedFields for the Authorization header in WAF logging.
