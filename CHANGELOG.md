@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-23
+
 ### Added
 - Tracked performance note `docs/performance/repo-sync-latency.md` recording
   the measured git first-request latency (147 objects / 8.4 s cold sync on
