@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Security
+- Redact the `Authorization` header in WAF logging (`WafLoggingConfiguration`
+  `RedactedFields`) so git PATs/JWTs are no longer written to the
+  `aws-waf-logs-gitgateway` log group. Cookie and query-string redaction are
+  not included (possible follow-up).
 
 ## [0.2.6] - 2026-11-23
 

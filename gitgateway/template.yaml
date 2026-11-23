@@ -780,6 +780,10 @@ Resources:
       ResourceArn: !GetAtt WebAcl.Arn
       LogDestinationConfigs:
         - !GetAtt WafLogGroup.Arn
+      # Authorization carries git PATs/JWTs (Basic auth); never log it.
+      RedactedFields:
+        - SingleHeader:
+            Name: authorization
 
   CloudFrontDistribution:
     Type: AWS::CloudFront::Distribution
